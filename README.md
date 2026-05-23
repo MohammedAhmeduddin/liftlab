@@ -177,95 +177,11 @@ f8 : 0.000906
 
 ### System Flow
 
-┌─────────────────────────────────────────────────────────┐
-│ Data Layer │
-│ ├─ Criteo CSV (14M rows) → load_criteo() │
-│ └─ Olist CSVs (100K orders) → load_olist() │
-└─────────────────────────────────────────────────────────┘
-↓
-┌─────────────────────────────────────────────────────────┐
-│ Feature Engineering (dbt) │
-│ ├─ models/features/behavioral_features.sql │
-│ ├─ models/features/rfm_scores.sql │
-│ └─ models/experiments/experiment_populations.sql │
-└─────────────────────────────────────────────────────────┘
-↓
-┌─────────────────────────────────────────────────────────┐
-│ Causal Inference Engine │
-│ ├─ DoWhy: Causal graph → identification │
-│ ├─ PSM: Propensity score matching │
-│ ├─ DiD: Difference-in-differences │
-│ └─ EconML: T/X-Learner, CausalForest │
-└─────────────────────────────────────────────────────────┘
-↓
-┌─────────────────────────────────────────────────────────┐
-│ Interpretability Layer │
-│ └─ SHAP: Feature importance for treatment effects │
-└─────────────────────────────────────────────────────────┘
-↓
-┌─────────────────────────────────────────────────────────┐
-│ Persistence & Monitoring │
-│ ├─ PostgreSQL: Experiment configs + results │
-│ ├─ MLflow: ATE, CATE, CIs, refutation p-values │
-│ └─ Drift Monitor: PSI + MMD → retraining trigger │
-└─────────────────────────────────────────────────────────┘
-↓
-┌─────────────────────────────────────────────────────────┐
-│ User Interfaces │
-│ ├─ FastAPI: POST /estimate, GET /experiments │
-│ └─ Streamlit: Experiment comparison + segment viz │
-└─────────────────────────────────────────────────────────┘
+![alt text](image.png)
 
 ## Project Structure
 
-liftlab/
-├── src/liftlab/
-│ ├── causal/
-│ │ ├── graph.py # DoWhy causal DAG
-│ │ ├── estimators.py # PSM, DiD
-│ │ ├── uplift.py # T/X-Learner, CausalForest
-│ │ └── refutation.py # DoWhy refutation tests
-│ ├── features/
-│ │ └── engineering.py # RFM, behavioral features
-│ ├── monitoring/
-│ │ ├── drift.py # PSI, MMD drift detection
-│ │ └── alerts.py # Slack alerting
-│ ├── api/
-│ │ ├── main.py # FastAPI app
-│ │ ├── schemas.py # Pydantic request/response models
-│ │ └── routes/
-│ │ ├── estimate.py # POST /estimate endpoint
-│ │ └── experiments.py # CRUD endpoints
-│ ├── db/
-│ │ ├── models.py # SQLAlchemy ORM
-│ │ └── session.py # DB session management
-│ ├── dashboard/
-│ │ └── app.py # Streamlit dashboard
-│ ├── data/
-│ │ └── loaders.py # Criteo + Olist data loaders
-│ ├── config.py # Pydantic settings
-│ └── mlflow_logger.py # MLflow tracking utilities
-├── dbt/
-│ └── models/
-│ ├── features/ # Behavioral feature SQL models
-│ └── experiments/ # Experiment population models
-├── tests/ # 53 tests, 83% coverage
-│ ├── test_estimators.py
-│ ├── test_drift.py
-│ ├── test_api.py
-│ └── ...
-├── notebooks/eda/ # Validation scripts
-│ ├── 00_data_validation.py
-│ ├── 01_causal_estimators_test.py
-│ ├── 02_uplift_models_test.py
-│ ├── 03_api_test.py
-│ └── 04_drift_detection_test.py
-├── .github/workflows/
-│ ├── ci.yml # Test + lint on push
-│ └── retrain.yml # Drift-triggered retraining
-├── docker-compose.yml
-├── pyproject.toml
-└── README.md
+![alt text](image-1.png)
 
 ### MLOps: Drift Detection Pipeline
 
@@ -416,8 +332,8 @@ Olist for the Brazilian E-Commerce Public Dataset
 
 Contact
 
-Your Name
+Ahmeduddin Mohammed
 
-📧 your.email@example.com
-🔗 linkedin.com/in/yourprofile
-💻 github.com/yourusername
+📧 mohammed.ahmeduddin16@gmail.com
+🔗 https://www.linkedin.com/in/mohammed-ahmeduddin/
+💻 https://github.com/MohammedAhmeduddin
