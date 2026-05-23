@@ -1,3 +1,4 @@
+# .github/workflows/ci.yml
 name: LiftLab CI
 
 on:
@@ -9,6 +10,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       postgres:
@@ -39,6 +41,12 @@ jobs:
           pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Create .env
+        run: |
+          cp .env.example .env
+          echo "DATABASE_URL=postgresql://liftlab:liftlab@localhost:5432/liftlab" >> .env
+          echo "MLFLOW_TRACKING_URI=http://localhost:5001" >> .env
+
       - name: Create test data directory
         run: mkdir -p data
 
@@ -49,36 +57,37 @@ jobs:
           import numpy as np
           rng = np.random.default_rng(42)
           n = 10000
-          df = pd.DataFrame({
-              **{f'f{i}': rng.standard_normal(n) for i in range(12)},
-              'treatment': rng.binomial(1, 0.85, n),
-              'conversion': rng.binomial(1, 0.003, n),
-              'visit': rng.binomial(1, 0.05, n),
-              'exposure': rng.binomial(1, 0.8, n),
-          })
+          data = {f'f{i}': rng.standard_normal(n) for i in range(12)}
+          df = pd.DataFrame(data)
+          df['treatment'] = rng.binomial(1, 0.85, n)
+          df['conversion'] = rng.binomial(1, 0.003, n)
+          df['visit'] = rng.binomial(1, 0.05, n)
+          df['exposure'] = rng.binomial(1, 0.8, n)
           df.to_csv('data/criteo_uplift.csv', index=False)
-          print(f'✅ Created mock Criteo dataset: {len(df)} rows')
+          print(f'✅ Created mock Criteo dataset: {len(df):,} rows')
           "
 
       - name: Create mock Olist data (empty placeholder)
-        run: |
-          mkdir -p data/olist
-          touch data/olist/.gitkeep
+        run: mkdir -p data/olist
 
       - name: Run tests
-        env:
-          DATABASE_URL: postgresql://liftlab:liftlab@localhost:5432/liftlab
-          MLFLOW_TRACKING_URI: http://localhost:5001
         run: |
-          pytest tests/ -v --cov=liftlab --cov-report=xml --cov-report=term-missing --maxfail=5 --timeout=300
+          pytest tests/ -v \
+            --cov=liftlab \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --maxfail=5 \
+            -k "not test_load_olist"
+        # Skip olist tests in CI since we don't have the full dataset
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          files: ./coverage.xml
+          file: ./coverage.xml
           flags: unittests
           name: codecov-liftlab
-          fail_ci_if_error: false
+        if: always()
 
       - name: Lint with ruff
-        run: ruff check src/ --exit-zero
+        run: ruff check src/
+        if: always()
