@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liftlab"
+version = "0.1.0"
+description = "Production causal inference engine for e-commerce promotion uplift"
+requires-python = ">=3.11"
+dependencies = [
+    # Causal inference
+    "dowhy>=0.11",
+    "econml>=0.15",
+    # ML base
+    "scikit-learn>=1.4",
+    "shap>=0.45",
+    "xgboost>=2.0",
+    "lightgbm>=4.3",
+    # Data
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=15.0",
+    # Stats
+    "scipy>=1.13",
+    "statsmodels>=0.14",
+    # API
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    # Database
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg2-binary>=2.9",
+    # MLflow
+    "mlflow>=2.13",
+    # Monitoring
+    "evidently>=0.4",
+    # Storage
+    "boto3>=1.34",
+    # Dashboard
+    "streamlit>=1.35",
+    "plotly>=5.22",
+    # Utilities
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "loguru>=0.7",
+    "tenacity>=8.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

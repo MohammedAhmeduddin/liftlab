@@ -1,0 +1,89 @@
+# .github/workflows/retrain.yml
+name: Drift-Triggered Retraining
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment_name:
+        description: "Experiment name to retrain"
+        required: true
+        default: "criteo_causalforest_v1"
+      severity:
+        description: "Drift severity (moderate|severe)"
+        required: true
+        default: "severe"
+        type: choice
+        options:
+          - moderate
+          - severe
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.severity == 'severe'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Create mock dataset
+        run: |
+          mkdir -p data
+          python -c "
+          import pandas as pd
+          import numpy as np
+          rng = np.random.default_rng(42)
+          n = 5000
+          df = pd.DataFrame({
+              **{f'f{i}': rng.standard_normal(n) for i in range(12)},
+              'treatment': rng.binomial(1, 0.85, n),
+              'conversion': rng.binomial(1, 0.003, n),
+              'visit': rng.binomial(1, 0.05, n),
+              'exposure': rng.binomial(1, 0.8, n),
+          })
+          df.to_csv('data/criteo_uplift.csv', index=False)
+          "
+
+      - name: Log drift event
+        run: |
+          echo "🔴 Drift detected for experiment: ${{ github.event.inputs.experiment_name }}"
+          echo "Severity: ${{ github.event.inputs.severity }}"
+          echo "Triggered at: $(date -u)"
+
+      - name: Run retraining
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          from liftlab.data.loaders import load_criteo
+          from liftlab.causal.uplift import CausalForestUplift
+          import warnings
+          warnings.filterwarnings('ignore')
+
+          print('Loading data...')
+          df = load_criteo(sample_frac=0.05)
+          feature_cols = [f'f{i}' for i in range(12)]
+
+          print('Retraining CausalForest...')
+          cf = CausalForestUplift(n_estimators=48)
+          result = cf.fit_estimate(df, feature_cols)
+
+          print(f'✅ Retrain complete')
+          print(f'   ATE={result.ate:.6f}')
+          print(f'   CI=[{result.ate_lower:.6f}, {result.ate_upper:.6f}]')
+          print(f'   N={len(df):,}')
+          "
+
+      - name: Notify completion
+        run: |
+          echo "✅ Retraining complete for ${{ github.event.inputs.experiment_name }}"
+          echo "New model ready for deployment"

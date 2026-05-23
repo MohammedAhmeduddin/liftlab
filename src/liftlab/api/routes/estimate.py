@@ -1,0 +1,225 @@
+# src/liftlab/api/routes/estimate.py
+"""
+Core causal estimation endpoint.
+POST /estimate → runs the full causal pipeline and returns results.
+"""
+import time
+import warnings
+from uuid import UUID, uuid4
+from datetime import datetime
+
+import numpy as np
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from loguru import logger
+
+from liftlab.db.session import get_db_dependency
+from liftlab.db.models import Experiment, EstimationRun
+from liftlab.api.schemas import EstimateRequest, EstimateResponse, SegmentEffect
+from liftlab.data.loaders import load_criteo
+from liftlab.causal.estimators import PropensityScoreMatching, DifferenceInDifferences
+from liftlab.causal.uplift import TLearnerUplift, XLearnerUplift, CausalForestUplift
+from liftlab.mlflow_logger import log_causal_run
+
+router = APIRouter(prefix="/estimate", tags=["estimation"])
+
+FEATURE_COLS = [f"f{i}" for i in range(12)]
+
+
+def _run_estimator(experiment: Experiment, df):
+    """Dispatch to the correct estimator based on experiment config."""
+    estimator = experiment.estimator
+    feature_cols = experiment.feature_cols
+    treatment_col = experiment.treatment_col
+    outcome_col = experiment.outcome_col
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+
+        if estimator == "psm":
+            model = PropensityScoreMatching(n_bootstrap=200)
+            result = model.estimate(df, feature_cols, treatment_col, outcome_col)
+            return {
+                "ate": result.ate,
+                "ci_lower": result.ci_lower,
+                "ci_upper": result.ci_upper,
+                "p_value": result.p_value,
+                "n_treated": result.n_treated,
+                "n_control": result.n_control,
+                "shap_importance": None,
+                "segment_effects": None,
+                "std_error": result.std_error,
+            }
+
+        elif estimator == "tlearner":
+            model = TLearnerUplift()
+            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
+
+        elif estimator == "xlearner":
+            model = XLearnerUplift()
+            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
+
+        elif estimator == "causalforest":
+            model = CausalForestUplift(n_estimators=100)
+            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
+
+        else:
+            raise ValueError(f"Unknown estimator: {estimator}")
+
+    # CATE-based estimators — compute SHAP importance and segments
+    shap_importance = None
+    if hasattr(model, "feature_importance") and result.shap_values is not None:
+        try:
+            imp_df = model.feature_importance(feature_cols)
+            shap_importance = dict(zip(imp_df["feature"], imp_df["shap_importance"]))
+        except Exception as e:
+            logger.warning(f"Feature importance failed: {e}")
+
+    segment_effects = None
+    if result.shap_values is not None:
+        try:
+            top_feature = feature_cols[0]
+            if shap_importance:
+                top_feature = max(shap_importance, key=shap_importance.get)
+            segs = result.segment_effects(df, col=top_feature, n_bins=4)
+            segment_effects = segs.to_dict(orient="records")
+        except Exception as e:
+            logger.warning(f"Segment effects failed: {e}")
+
+    n_treated = int((df[treatment_col] == 1).sum())
+    n_control = int((df[treatment_col] == 0).sum())
+
+    return {
+        "ate": result.ate,
+        "ci_lower": result.ate_lower,
+        "ci_upper": result.ate_upper,
+        "p_value": None,
+        "n_treated": n_treated,
+        "n_control": n_control,
+        "shap_importance": shap_importance,
+        "segment_effects": segment_effects,
+        "std_error": None,
+    }
+
+
+@router.post("/", response_model=EstimateResponse, status_code=status.HTTP_200_OK)
+def estimate(
+    payload: EstimateRequest,
+    db: Session = Depends(get_db_dependency),
+):
+    """
+    Run causal estimation for a registered experiment.
+
+    Loads data, dispatches to the correct estimator, logs to MLflow,
+    persists results to PostgreSQL, and returns the full estimate.
+    """
+    # Fetch experiment config
+    experiment = db.query(Experiment).filter(
+        Experiment.id == payload.experiment_id
+    ).first()
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    # Mark as running
+    experiment.status = "running"
+    db.flush()
+
+    start_time = time.time()
+
+    try:
+        # Load data
+        logger.info(f"Loading data for experiment '{experiment.name}'...")
+        df = load_criteo(sample_frac=experiment.sample_frac)
+
+        # Run estimator
+        logger.info(f"Running estimator: {experiment.estimator}")
+        results = _run_estimator(experiment, df)
+
+        duration = time.time() - start_time
+
+        # Log to MLflow
+        mlflow_run_id = log_causal_run(
+            experiment_name=experiment.name,
+            estimator=experiment.estimator,
+            ate=results["ate"],
+            ci_lower=results["ci_lower"],
+            ci_upper=results["ci_upper"],
+            n_treated=results["n_treated"],
+            n_control=results["n_control"],
+            p_value=results["p_value"],
+            shap_importance=results["shap_importance"],
+            extra_params={"sample_frac": experiment.sample_frac},
+            extra_metrics={"duration_seconds": duration},
+        )
+
+        # Persist results to PostgreSQL
+        run = EstimationRun(
+            id=uuid4(),
+            experiment_id=experiment.id,
+            mlflow_run_id=mlflow_run_id,
+            ate=results["ate"],
+            ci_lower=results["ci_lower"],
+            ci_upper=results["ci_upper"],
+            std_error=results["std_error"],
+            p_value=results["p_value"],
+            n_treated=results["n_treated"],
+            n_control=results["n_control"],
+            n_total=results["n_treated"] + results["n_control"],
+            shap_importance=results["shap_importance"],
+            segment_effects=results["segment_effects"],
+            estimator=experiment.estimator,
+            duration_seconds=duration,
+            metadata_={"sample_frac": experiment.sample_frac},
+        )
+        db.add(run)
+
+        experiment.status = "done"
+        db.flush()
+        db.refresh(run)
+
+        logger.info(
+            f"Estimation complete | experiment='{experiment.name}' | "
+            f"ATE={results['ate']:.6f} | duration={duration:.1f}s"
+        )
+
+        # Build segment effects response
+        seg_response = None
+        if results["segment_effects"]:
+            seg_response = [
+                SegmentEffect(
+                    bin=int(s.get("_bin", i)),
+                    mean_cate=float(s["mean_cate"]),
+                    n=int(s["n"]),
+                    feature_mean=float(s["feature_mean"]),
+                    lift_vs_average=float(s["lift_vs_average"]),
+                )
+                for i, s in enumerate(results["segment_effects"])
+            ]
+
+        return EstimateResponse(
+            run_id=run.id,
+            experiment_id=experiment.id,
+            mlflow_run_id=mlflow_run_id,
+            estimator=experiment.estimator,
+            ate=results["ate"],
+            ci_lower=results["ci_lower"],
+            ci_upper=results["ci_upper"],
+            ci_width=results["ci_upper"] - results["ci_lower"],
+            p_value=results["p_value"],
+            n_treated=results["n_treated"],
+            n_control=results["n_control"],
+            n_total=results["n_treated"] + results["n_control"],
+            shap_importance=results["shap_importance"],
+            segment_effects=seg_response,
+            duration_seconds=duration,
+            created_at=run.created_at,
+        )
+
+    except Exception as e:
+        experiment.status = "failed"
+        db.flush()
+        logger.error(f"Estimation failed for '{experiment.name}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
