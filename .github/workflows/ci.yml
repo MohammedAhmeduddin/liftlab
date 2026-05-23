@@ -1,4 +1,3 @@
-# .github/workflows/ci.yml
 name: LiftLab CI
 
 on:
@@ -58,23 +57,28 @@ jobs:
               'exposure': rng.binomial(1, 0.8, n),
           })
           df.to_csv('data/criteo_uplift.csv', index=False)
-          print(f'Created mock Criteo dataset: {len(df)} rows')
+          print(f'✅ Created mock Criteo dataset: {len(df)} rows')
           "
+
+      - name: Create mock Olist data (empty placeholder)
+        run: |
+          mkdir -p data/olist
+          touch data/olist/.gitkeep
 
       - name: Run tests
         env:
           DATABASE_URL: postgresql://liftlab:liftlab@localhost:5432/liftlab
           MLFLOW_TRACKING_URI: http://localhost:5001
         run: |
-          pytest tests/ -v --cov=liftlab --cov-report=xml --cov-report=term-missing -k "not slow"
+          pytest tests/ -v --cov=liftlab --cov-report=xml --cov-report=term-missing --maxfail=5 --timeout=300
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
         with:
           files: ./coverage.xml
           flags: unittests
           name: codecov-liftlab
+          fail_ci_if_error: false
 
       - name: Lint with ruff
-        run: ruff check src/
-        continue-on-error: true
+        run: ruff check src/ --exit-zero
