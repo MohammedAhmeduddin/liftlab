@@ -5,8 +5,7 @@ SQLAlchemy ORM models for experiment configs and causal results.
 import uuid
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean,
-    DateTime, JSON, Text, ForeignKey
+    Column, String, Float, Integer, DateTime, JSON, Text, ForeignKey
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship

@@ -41,7 +41,7 @@ class DriftReport:
 
     def summary(self) -> str:
         lines = [
-            f"Drift Report",
+            "Drift Report",
             f"  Reference N : {self.reference_size:,}",
             f"  Current N   : {self.current_size:,}",
             f"  MMD Score   : {self.mmd_score:.6f} {'⚠️' if self.mmd_flagged else '✅'}",

@@ -13,12 +13,11 @@ This reflects the reality that:
 - Those same features also independently drive conversion probability
 - So features are CONFOUNDERS — we must adjust for them
 """
-import networkx as nx
 import dowhy
 from dowhy import CausalModel
 import pandas as pd
 from loguru import logger
-from typing import Optional
+
 
 
 # Feature columns in the Criteo dataset
