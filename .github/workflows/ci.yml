@@ -46,31 +46,23 @@ jobs:
           echo "DATABASE_URL=postgresql://liftlab:liftlab@localhost:5432/liftlab" >> .env
           echo "MLFLOW_TRACKING_URI=http://localhost:5001" >> .env
 
-      - name: Create minimal test data
+      - name: Create dummy data files
         run: |
-          mkdir -p data
-          python -c "
-          import pandas as pd
-          import numpy as np
-          rng = np.random.default_rng(42)
-          n = 5000
-          df = pd.DataFrame({
-              **{f'f{i}': rng.standard_normal(n) for i in range(12)},
-              'treatment': rng.binomial(1, 0.85, n),
-              'conversion': rng.binomial(1, 0.003, n),
-              'visit': rng.binomial(1, 0.05, n),
-              'exposure': rng.binomial(1, 0.8, n),
-          })
-          df.to_csv('data/criteo_uplift.csv', index=False)
-          print(f'Created test dataset: {len(df)} rows')
-          "
+          mkdir -p data/olist
+          # Create a minimal valid Criteo CSV for tests
+          echo "f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,treatment,conversion,visit,exposure" > data/criteo_uplift.csv
+          echo "1,2,3,4,5,6,7,8,9,10,11,12,1,0,1,1" >> data/criteo_uplift.csv
+          echo "2,3,4,5,6,7,8,9,10,11,12,13,0,1,0,1" >> data/criteo_uplift.csv
+          # Create dummy Olist CSVs
+          echo "col1,col2" > data/olist/test.csv
+          echo "val1,val2" >> data/olist/test.csv
 
-      - name: Run tests (exclude slow tests)
+      - name: Run tests
         run: |
           pytest tests/ -v \
-            --ignore=tests/test_estimate_full_coverage.py \
-            --ignore=tests/test_uplift_models.py \
-            -k "not causalforest"
+            --ignore=tests/test_data_loaders.py \
+            --ignore=tests/test_loaders_edge_cases.py \
+            --cov=liftlab --cov-report=term-missing
 
       - name: Lint
-        run: ruff check src/ --exit-zero
+        run: ruff check src/
