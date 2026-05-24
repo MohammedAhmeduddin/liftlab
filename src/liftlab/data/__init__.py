@@ -1,1 +1,1 @@
-# Data loaders module
+# src/liftlab/data/__init__.py

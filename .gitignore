@@ -70,3 +70,8 @@ mlflow_artifacts/
 
 # Alembic
 alembic/versions/*.pyc
+
+
+# Ignore data directory at root, but NOT the Python module
+/data/
+!src/liftlab/data/
