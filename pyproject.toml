@@ -36,6 +36,7 @@ dependencies = [
     "plotly>=5.22",
     # Utilities
     "httpx>=0.27",
+    "matplotlib>=3.8",
     "python-dotenv>=1.0",
     "loguru>=0.7",
 ]

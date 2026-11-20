@@ -7,7 +7,13 @@
 
 LiftLab measures how much an ad campaign **caused** users to visit and convert, and **which users** it moved. It runs on the full [Criteo Uplift v2.1](https://ailab.criteo.com/criteo-uplift-prediction-dataset/) dataset: 13,979,592 users, 85% shown ads, 15% held out.
 
-Every estimator is first checked against simulated data where the true effect is known, then run on Criteo. The benchmark found a problem in the data itself: the "randomized" groups are not quite balanced. That changes the headline answer, and it is the main finding below.
+**In 30 seconds**
+
+- **Found a flaw in a public benchmark dataset.** Criteo is published as a randomized trial, but treatment can be predicted from the features. The textbook treated-minus-control comparison overstates the visit effect by **39%**. LiftLab detects this and switches to a covariate-adjusted reference (AIPW).
+- **Found who to target.** One quarter of users produce about **94% of the extra conversions** (3.70× the average effect). A Causal Forest ranks users with a held-out Qini of **0.339** on visits.
+- **Built to be checked.** Every estimator is validated on simulated data with a known answer before it touches real data. 99 tests, 94% coverage, CI on every push, and one command reproduces the benchmark in under 3 minutes.
+
+![Raw vs adjusted effect, and the effect by f8 group](docs/criteo_effects.svg)
 
 ---
 
@@ -43,28 +49,30 @@ The imbalance is tiny by usual standards (SMD < 0.1). But at 14M rows it is real
 | 3.635 – 3.911 | 3,539,789 (25%) | **0.003686** [0.003430, 0.003942] | **3.70×** | 3.42× |
 | 3.911 – 3.972 | 10,439,803 (75%) | 0.000085 [0.000064, 0.000106] | 0.09× | 0.18× |
 
-A quarter of users produce nearly all of the incremental conversions. Showing ads only to that group keeps most of the lift for about a quarter of the impressions.
+That quarter of users produces about **94% of the incremental conversions** (0.003686 × 3,539,789 ≈ 13,050 of ≈ 13,940) and about 87% of the incremental visits. Showing ads only to that group keeps nearly all of the lift for a quarter of the impressions.
 
 ### 3. Estimators on a 2% sample (279,592 rows) vs the all-rows reference
 
-| Estimator | Estimand | Conversion (95% CI) | Visit (95% CI) | CI contains reference |
-|---|---|---|---|---|
-| Difference in means | ATE | 0.001303 [0.000818, 0.001788] | 0.008490 [0.006425, 0.010556] | ✅ ✅ |
-| AIPW (cross-fitted) | ATE | 0.001008 [0.000550, 0.001467] | 0.006101 [0.004364, 0.007838] | ✅ ✅ |
-| Propensity score matching | ATT | 0.001020 [0.000431, 0.001608] | 0.006734 [0.004195, 0.009273] | ✅ ✅ |
+| Estimator | Estimand | Conversion (95% CI) | Contains reference | Visit (95% CI) | Contains reference |
+|---|---|---|---|---|---|
+| Difference in means | ATE | 0.001303 [0.000818, 0.001788] | Yes | 0.008490 [0.006425, 0.010556] | Yes |
+| AIPW (cross-fitted) | ATE | 0.001008 [0.000550, 0.001467] | Yes | 0.006101 [0.004364, 0.007838] | Yes |
+| Propensity score matching | ATT | 0.001020 [0.000431, 0.001608] | Yes | 0.006734 [0.004195, 0.009273] | Yes |
+
+The references are 0.000997 (conversion) and 0.007459 (visit).
 
 PSM matched 237,311 of 237,543 treated users (99.9%). No control was reused more than 50 times.
 
 ### 4. Confounded-sample test: can the estimators undo a known bias?
 
-I bias the sample on purpose. Untreated users are dropped depending on the feature that best predicts the outcome, so the control share falls from 15.0% to 9.6%. Treated users are untouched, so the right answer is still the reference effect.
+The test biases a sample on purpose: untreated users are dropped depending on the feature that best predicts the outcome, so the control share falls from 15.0% to 9.6%. Treated users are untouched, so the right answer is still the reference effect.
 
-| Outcome | Biased through | Naive difference | AIPW (ATT) | PSM (ATT) | Target |
+| Outcome | Biased through | Target | Naive difference | AIPW (ATT) | PSM (ATT) |
 |---|---|---|---|---|---|
-| Visit | f9 | **−0.010405** ❌ (sign flipped) | 0.005739 ✅ | 0.007125 ✅ | 0.007459 |
-| Conversion | f11 | 0.001873 ❌ (≈ 2× too high) | −0.000070 ✅ (CI ±0.0012) | 0.000847 ✅ | 0.000997 |
+| Visit | f9 | 0.007459 | **−0.010405** (sign flipped) ✗ | 0.005739 ✓ | 0.007125 ✓ |
+| Conversion | f11 | 0.000997 | 0.001873 (≈ 1.9× too high) ✗ | −0.000070 ✓ (CI ±0.0012) | 0.000847 ✓ |
 
-✅ means the 95% CI contains the target. The naive comparison fails both times. For conversion, AIPW's interval contains the target only because it is very wide: with 0.3% positives and 9.6% controls, there is little signal left. PSM is the more precise estimator in that case.
+✓ means the 95% CI contains the target; ✗ means it does not. The naive comparison fails both times. For conversion, AIPW's interval contains the target only because it is very wide: with 0.3% positives and 9.6% controls, there is little signal left. PSM is the more precise estimator in that case.
 
 ### 5. Targeting models judged on held-out users
 
@@ -89,7 +97,7 @@ On conversion, all three checks pass:
 
 ## Bugs found and fixed during this audit
 
-Each fix has a regression test.
+Each fix has a regression test. The four with the largest effect on the results:
 
 | Problem | Effect | Fix |
 |---|---|---|
@@ -97,11 +105,19 @@ Each fix has a regression test.
 | Criteo file is stored ordered by treatment, and 52% of users share one f8 value | Rank-based quartiles split tied users by file position, giving fake segments (3.61×, 0.14×, NaN, 0.02×) | Value-based bins for features; random tie-breaking for model scores |
 | Tied propensity scores in PSM | One control reused 147,395 times (reproduction); CI ±0.09 on a 0.001 effect | Random tie-breaking smaller than any score gap |
 | Logistic propensity on skewed features | Left ~50% of injected bias; CIs covered the truth 27% of the time | Gradient-boosted propensity with early stopping |
+
+<details>
+<summary>Five more fixes</summary>
+
+| Problem | Effect | Fix |
+|---|---|---|
 | Bootstrap CI for matching with replacement | Invalid (Abadie & Imbens 2008); an estimate fell outside its own CI | Abadie–Imbens style variance with a control-reuse term; 97.5% coverage in 40 simulations |
 | Difference-in-differences on Criteo with a fabricated time column | A meaningless number | DiD kept for real panel data, validated on simulation only |
 | T/X-Learner CIs from bootstraps that never refit | Overconfident intervals | Models judged on held-out data instead |
 | Segment lift measured in-sample | Optimistic numbers | 50/50 stratified train/test split |
 | MLflow check only tested if a port was open | On macOS, AirPlay answers on port 5000; each call hung ~4 min | Probe requires HTTP 200 from `/health` |
+
+</details>
 
 ---
 
@@ -152,6 +168,7 @@ Download the Criteo Uplift v2.1 CSV from the [Criteo AI Lab page](https://ailab.
 ```bash
 python scripts/check_randomization.py     # balance, C2ST, DM vs AIPW on 5 samples
 python scripts/benchmark_criteo.py        # full benchmark → results/criteo_benchmark.json
+python scripts/make_readme_chart.py       # README chart → docs/criteo_effects.svg
 streamlit run src/liftlab/dashboard/app.py
 ```
 
@@ -207,6 +224,7 @@ src/liftlab/
 scripts/
   benchmark_criteo.py      the full benchmark
   check_randomization.py   standalone randomization diagnostics
+  make_readme_chart.py     the README chart, drawn from the benchmark JSON
 ```
 
 ---
