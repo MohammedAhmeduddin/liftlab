@@ -27,8 +27,7 @@ import pandas as pd
 import statsmodels.formula.api as smf
 from loguru import logger
 from scipy import stats
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.model_selection import KFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
@@ -99,6 +98,16 @@ def _default_outcome_model():
     return HistGradientBoostingRegressor(max_iter=100, max_depth=4, random_state=0)
 
 
+def _default_propensity_model():
+    """Gradient boosting, not logistic regression: selection that depends
+    non-linearly on a skewed or heavily tied feature (common in Criteo) is
+    missed by a linear-logit model, and matching or weighting on a wrong
+    propensity leaves most of the bias in place."""
+    return HistGradientBoostingClassifier(
+        max_iter=300, max_depth=3, learning_rate=0.05, early_stopping=True,
+        n_iter_no_change=10, random_state=0)
+
+
 def cross_fit_nuisances(
     X: np.ndarray,
     t: np.ndarray,
@@ -121,8 +130,8 @@ def cross_fit_nuisances(
             idx = train[t[train] == arm]
             target[test] = outcome_model().fit(X[idx], y[idx]).predict(X[test])
         if propensity is None:
-            lr = LogisticRegression(max_iter=1000).fit(X[train], t[train])
-            e[test] = lr.predict_proba(X[test])[:, 1]
+            model = _default_propensity_model().fit(X[train], t[train])
+            e[test] = model.predict_proba(X[test])[:, 1]
         else:
             e[test] = propensity
     return mu0, mu1, np.clip(e, 0.01, 0.99)
@@ -217,7 +226,7 @@ class PropensityScoreMatching:
 
     @staticmethod
     def _logit_propensity(X: np.ndarray, t: np.ndarray) -> np.ndarray:
-        model = LogisticRegression(max_iter=1000).fit(X, t)
+        model = _default_propensity_model().fit(X, t)
         p = np.clip(model.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
         return np.log(p / (1 - p))
 

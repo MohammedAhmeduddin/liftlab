@@ -233,7 +233,7 @@ elif page == "📈 Results":
             if isinstance(r, dict):
                 rows.append({"name": f"{r['method']} ({r['estimand']})", "est": r["estimate"],
                              "lo": r["ci"][0], "hi": r["ci"][1]})
-        conf = bench.get("confounded_test", {})
+        conf = bench.get("confounded_test", {}).get("conversion", {})
         for key in ("naive_difference_in_means", "aipw_att", "psm"):
             if key in conf:
                 r = conf[key]

@@ -116,6 +116,19 @@ class TestPSM:
         assert abs(est.ate - truth) < abs(difference_in_means(conf).ate - truth)
         assert est.ci_lower < est.ci_upper
 
+    def test_handles_selection_on_a_skewed_feature(self):
+        """Selection on a skewed feature (like Criteo's) is non-linear on the
+        raw scale. A logistic propensity misses it and left ~50% of the bias
+        in place; the boosted propensity model recovers the effect."""
+        d = simulate_rct(60_000, base_rate=0.05, base_effect=0.01, seed=201)
+        d["f0"] = np.exp(2 * d["f0"])
+        truth = d.loc[d.treatment == 1, "_true_cate"].mean()
+        conf = make_confounded(d, feature="f0", strength=1.5, seed=1)
+        naive = difference_in_means(conf)
+        assert not covers(naive, truth)
+        assert covers(PropensityScoreMatching().estimate(conf, FEATURES), truth)
+        assert covers(aipw(conf, FEATURES, estimand="ATT"), truth)
+
     def test_keeps_nearly_all_treated_units(self, rct):
         """Matching with replacement: unlike greedy 1:1 without replacement,
         treated units are not dropped just because controls are scarce."""

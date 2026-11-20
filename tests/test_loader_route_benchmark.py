@@ -178,5 +178,7 @@ def test_benchmark_script_end_to_end(tmp_path):
     assert ref["aipw"]["ci"][0] < ref["aipw"]["estimate"] < ref["aipw"]["ci"][1]
     # f8 groups carry both the raw and the AIPW effect
     assert {"uplift", "aipw", "aipw_lift_vs_overall"} <= set(sections["f8_groups"]["conversion"][0])
-    assert sections["confounded_test"]["aipw_att"]["estimand"] == "ATT"
+    for y in ("conversion", "visit"):
+        assert sections["confounded_test"][y]["aipw_att"]["estimand"] == "ATT"
+        assert sections["confounded_test"][y]["psm"]["estimand"] == "ATT"
     assert set(sections["cate_models_holdout"]["visit"]) >= {"tlearner", "xlearner", "causalforest"}

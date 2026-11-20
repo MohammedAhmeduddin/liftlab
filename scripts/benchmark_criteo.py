@@ -186,27 +186,34 @@ def main(argv=None) -> int:
 
     t0 = section("4. Confounded-sample test")
     y0 = args.outcomes[0]
-    controls = sample[sample.treatment == 0]
-    corr = {f: abs(float(np.corrcoef(controls[f], controls[y0])[0, 1])) for f in FEATURES}
-    driver = max(corr, key=corr.get)
-    conf = make_confounded(sample, feature=driver, strength=1.5, seed=args.seed)
-    naive = difference_in_means(conf, outcome_col=y0)
-    conf_res = {
-        "outcome": y0, "confounding_feature": driver, "feature_outcome_corr": corr[driver],
-        "rows": len(conf), "control_share": float(1 - conf.treatment.mean()),
-        "control_share_before": float(1 - sample.treatment.mean()),
-        "target": target[y0],
-        "naive_difference_in_means": est_dict(naive),
-        "aipw_att": est_dict(aipw(conf, FEATURES, outcome_col=y0, estimand="ATT")),
-        "psm": est_dict(PropensityScoreMatching(seed=args.seed)
-                        .estimate(conf, FEATURES, outcome_col=y0)),
-    }
-    for k in ("naive_difference_in_means", "aipw_att", "psm"):
-        r = conf_res[k]
-        r["covers_target"] = bool(r["ci"][0] <= conf_res["target"] <= r["ci"][1])
-        print(f"  {k:26s} {r['estimate']:.6f}  CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  "
-              f"covers target {conf_res['target']:.6f}: {r['covers_target']}")
-    rep.add("confounded_test", conf_res, time.perf_counter() - t0)
+    confounded = {}
+    for y in args.outcomes:
+        # Bias the sample through the feature that best predicts the outcome,
+        # so the injected confounding actually moves the naive comparison.
+        controls = sample[sample.treatment == 0]
+        corr = {f: abs(float(np.corrcoef(controls[f], controls[y])[0, 1])) for f in FEATURES}
+        driver = max(corr, key=corr.get)
+        conf = make_confounded(sample, feature=driver, strength=1.5, seed=args.seed)
+        res = {
+            "confounding_feature": driver, "feature_outcome_corr": corr[driver],
+            "rows": len(conf), "control_share": float(1 - conf.treatment.mean()),
+            "control_share_before": float(1 - sample.treatment.mean()),
+            "target": target[y],
+            "naive_difference_in_means": est_dict(difference_in_means(conf, outcome_col=y)),
+            "aipw_att": est_dict(aipw(conf, FEATURES, outcome_col=y, estimand="ATT")),
+            "psm": est_dict(PropensityScoreMatching(seed=args.seed)
+                            .estimate(conf, FEATURES, outcome_col=y)),
+        }
+        print(f"  {y}: biased through {driver}; control share "
+              f"{res['control_share_before']:.1%} → {res['control_share']:.1%}")
+        for k in ("naive_difference_in_means", "aipw_att", "psm"):
+            r = res[k]
+            r["covers_target"] = bool(r["ci"][0] <= res["target"] <= r["ci"][1])
+            r["error_vs_target"] = r["estimate"] - res["target"]
+            print(f"    {k:26s} {r['estimate']:.6f}  CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  "
+                  f"covers target {res['target']:.6f}: {r['covers_target']}")
+        confounded[y] = res
+    rep.add("confounded_test", confounded, time.perf_counter() - t0)
 
     t0 = section("5. CATE models on a held-out split")
     cate = {}
