@@ -19,7 +19,11 @@ class ExperimentCreate(BaseModel):
     treatment_col: str = Field(default="treatment")
     outcome_col: str = Field(default="conversion")
     feature_cols: list[str] = Field(..., min_length=1)
-    estimator: Literal["psm", "did", "tlearner", "xlearner", "causalforest"] = "causalforest"
+    # DiD is a library estimator for panel data; Criteo has no time dimension,
+    # so it is not offered here.
+    estimator: Literal[
+        "difference_in_means", "aipw", "psm", "tlearner", "xlearner", "causalforest"
+    ] = "difference_in_means"
     sample_frac: float = Field(default=0.1, ge=0.001, le=1.0)
 
     @field_validator("feature_cols")
@@ -56,11 +60,13 @@ class EstimateRequest(BaseModel):
 
 
 class SegmentEffect(BaseModel):
-    bin: int
-    mean_cate: float
+    """Observed (not predicted) uplift in a held-out quartile of predicted effect."""
+    group: int                      # 0 = highest predicted effect
     n: int
-    feature_mean: float
-    lift_vs_average: float
+    uplift: Optional[float]
+    ci_lower: Optional[float]
+    ci_upper: Optional[float]
+    lift_vs_overall: Optional[float]
 
 
 class EstimateResponse(BaseModel):
@@ -68,12 +74,13 @@ class EstimateResponse(BaseModel):
     experiment_id: UUID
     mlflow_run_id: Optional[str]
     estimator: str
+    estimand: str                   # ATE or ATT
 
-    # Core results
+    # Average effect
     ate: float
-    ci_lower: float
-    ci_upper: float
-    ci_width: float
+    ci_lower: Optional[float]
+    ci_upper: Optional[float]
+    ci_width: Optional[float]
     p_value: Optional[float]
 
     # Sample info
@@ -81,9 +88,12 @@ class EstimateResponse(BaseModel):
     n_control: int
     n_total: int
 
-    # Heterogeneous effects
-    shap_importance: Optional[dict[str, float]]
-    segment_effects: Optional[list[SegmentEffect]]
+    # Heterogeneous effects (CATE models only; evaluated on a held-out split)
+    mean_cate: Optional[float] = None
+    qini_coefficient: Optional[float] = None
+    top_25pct_lift: Optional[float] = None
+    feature_importance: Optional[dict[str, float]] = None
+    segment_effects: Optional[list[SegmentEffect]] = None
 
     # Run info
     duration_seconds: float

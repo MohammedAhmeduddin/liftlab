@@ -1,6 +1,6 @@
 # src/liftlab/db/session.py
 """
-SQLAlchemy async session factory and database initialization.
+SQLAlchemy session factory and database initialization.
 """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
@@ -11,8 +11,18 @@ from liftlab.db.models import Base
 
 settings = get_settings()
 
+def normalize_url(url: str) -> str:
+    """Use the psycopg (v3) driver explicitly. Plain ``postgresql://`` means
+    psycopg2 on SQLAlchemy 2.0 but psycopg on 2.1; pinning it here makes
+    the installed driver work on both."""
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    return url
+
+
 engine = create_engine(
-    settings.database_url,
+    normalize_url(settings.database_url),
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,

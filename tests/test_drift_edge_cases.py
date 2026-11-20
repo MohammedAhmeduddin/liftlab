@@ -1,7 +1,6 @@
 # tests/test_drift_edge_cases.py
 """Edge case tests for drift detection."""
 import numpy as np
-import pandas as pd
 from liftlab.monitoring.drift import compute_psi, DriftReport
 
 

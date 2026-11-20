@@ -3,8 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from liftlab.api.main import app
-from liftlab.db.session import SessionLocal, Base, engine
-from liftlab.db.models import Experiment
+from liftlab.db.session import Base, engine
 
 client = TestClient(app)
 

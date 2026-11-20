@@ -1,225 +1,150 @@
-# src/liftlab/api/routes/estimate.py
 """
-Core causal estimation endpoint.
-POST /estimate → runs the full causal pipeline and returns results.
+POST /estimate: run a registered experiment's estimator on Criteo data.
+
+Average-effect estimators (difference in means, AIPW, PSM) return an
+estimate with a 95% CI and the estimand. CATE models (T, X, Causal Forest)
+are fit on a training split and evaluated on a held-out split: the
+response reports their held-out Qini, observed uplift in the top 25%, and
+observed uplift by quartile of predicted effect. Their headline ATE is the
+difference in means, which is unbiased because Criteo is randomized.
 """
+
+from __future__ import annotations
+
+import math
 import time
-import warnings
+from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from loguru import logger
 from sqlalchemy.orm import Session
 
-from liftlab.db.session import get_db_dependency
-from liftlab.db.models import Experiment, EstimationRun
 from liftlab.api.schemas import EstimateRequest, EstimateResponse, SegmentEffect
+from liftlab.causal.estimators import PropensityScoreMatching, aipw, difference_in_means
+from liftlab.causal.evaluation import observed_uplift_by_group, score_groups
+from liftlab.causal.uplift import ESTIMATORS as CATE_ESTIMATORS
 from liftlab.data.loaders import load_criteo
-from liftlab.causal.estimators import PropensityScoreMatching
-from liftlab.causal.uplift import TLearnerUplift, XLearnerUplift, CausalForestUplift
+from liftlab.db.models import EstimationRun, Experiment
+from liftlab.db.session import get_db_dependency
 from liftlab.mlflow_logger import log_causal_run
-from loguru import logger
-from fastapi import APIRouter
 
 router = APIRouter(prefix="/estimate", tags=["estimation"])
 
 
-FEATURE_COLS = [f"f{i}" for i in range(12)]
+def _num(x: Any) -> Optional[float]:
+    """float, with NaN/inf -> None (JSON has no NaN)."""
+    if x is None:
+        return None
+    x = float(x)
+    return x if math.isfinite(x) else None
 
 
-def _run_estimator(experiment: Experiment, df):
-    """Dispatch to the correct estimator based on experiment config."""
-    estimator = experiment.estimator
-    feature_cols = experiment.feature_cols
-    treatment_col = experiment.treatment_col
-    outcome_col = experiment.outcome_col
+def _run_estimator(experiment: Experiment, df) -> dict:
+    """Dispatch to the experiment's estimator and return a flat result dict."""
+    name = experiment.estimator
+    features = experiment.feature_cols
+    t_col, y_col = experiment.treatment_col, experiment.outcome_col
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-
-        if estimator == "psm":
-            model = PropensityScoreMatching(n_bootstrap=200)
-            result = model.estimate(df, feature_cols, treatment_col, outcome_col)
-            return {
-                "ate": result.ate,
-                "ci_lower": result.ci_lower,
-                "ci_upper": result.ci_upper,
-                "p_value": result.p_value,
-                "n_treated": result.n_treated,
-                "n_control": result.n_control,
-                "shap_importance": None,
-                "segment_effects": None,
-                "std_error": result.std_error,
-            }
-
-        elif estimator == "tlearner":
-            model = TLearnerUplift()
-            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
-
-        elif estimator == "xlearner":
-            model = XLearnerUplift()
-            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
-
-        elif estimator == "causalforest":
-            model = CausalForestUplift(n_estimators=100)
-            result = model.fit_estimate(df, feature_cols, treatment_col, outcome_col)
-
+    if name in ("difference_in_means", "aipw", "psm"):
+        if name == "difference_in_means":
+            r = difference_in_means(df, t_col, y_col)
+        elif name == "aipw":
+            # Estimated propensity: on Criteo treatment is slightly predictable
+            # from the features (see scripts/check_randomization.py).
+            r = aipw(df, features, t_col, y_col)
         else:
-            raise ValueError(f"Unknown estimator: {estimator}")
+            r = PropensityScoreMatching().estimate(df, features, t_col, y_col)
+        return {"estimand": r.estimand, "ate": r.ate, "ci_lower": r.ci_lower,
+                "ci_upper": r.ci_upper, "std_error": r.std_error, "p_value": r.p_value,
+                "n_treated": r.n_treated, "n_control": r.n_control}
 
-    # CATE-based estimators — compute SHAP importance and segments
-    shap_importance = None
-    if hasattr(model, "feature_importance") and result.shap_values is not None:
-        try:
-            imp_df = model.feature_importance(feature_cols)
-            shap_importance = dict(zip(imp_df["feature"], imp_df["shap_importance"]))
-        except Exception as e:
-            logger.warning(f"Feature importance failed: {e}")
+    if name not in CATE_ESTIMATORS:
+        raise ValueError(f"Unknown estimator: {name}")
 
-    segment_effects = None
-    if result.shap_values is not None:
-        try:
-            top_feature = feature_cols[0]
-            if shap_importance:
-                top_feature = max(shap_importance, key=shap_importance.get)
-            segs = result.segment_effects(df, col=top_feature, n_bins=4)
-            segment_effects = segs.to_dict(orient="records")
-        except Exception as e:
-            logger.warning(f"Segment effects failed: {e}")
-
-    n_treated = int((df[treatment_col] == 1).sum())
-    n_control = int((df[treatment_col] == 0).sum())
-
+    model = CATE_ESTIMATORS[name](seed=42)
+    res, test = model.fit_evaluate(df, features, t_col, y_col)
+    quartile = score_groups(res.test_cate, 4)  # 0 = highest predicted; random tie-breaking
+    segments = observed_uplift_by_group(test[y_col].to_numpy(float), test[t_col].to_numpy(int), quartile)
+    # Average effect from AIPW (covariate-adjusted), consistent with the benchmark
+    avg = aipw(df, features, t_col, y_col)
     return {
-        "ate": result.ate,
-        "ci_lower": result.ate_lower,
-        "ci_upper": result.ate_upper,
-        "p_value": None,
-        "n_treated": n_treated,
-        "n_control": n_control,
-        "shap_importance": shap_importance,
-        "segment_effects": segment_effects,
-        "std_error": None,
+        "estimand": "ATE", "ate": avg.ate, "ci_lower": avg.ci_lower, "ci_upper": avg.ci_upper,
+        "std_error": avg.std_error, "p_value": avg.p_value,
+        "n_treated": avg.n_treated, "n_control": avg.n_control,
+        "mean_cate": res.mean_cate,
+        "qini_coefficient": res.evaluation["qini_coefficient"],
+        "top_25pct_lift": res.evaluation["top_25pct"]["lift_vs_overall"],
+        "feature_importance": res.feature_importance,
+        "segment_effects": [
+            {"group": int(s["group"]), "n": int(s["n"]), "uplift": _num(s["uplift"]),
+             "ci_lower": _num(s["ci_lower"]), "ci_upper": _num(s["ci_upper"]),
+             "lift_vs_overall": _num(s["lift_vs_overall"])}
+            for s in segments.to_dict(orient="records")
+        ],
     }
 
 
 @router.post("/", response_model=EstimateResponse, status_code=status.HTTP_200_OK)
-def estimate(
-    payload: EstimateRequest,
-    db: Session = Depends(get_db_dependency),
-):
-    """
-    Run causal estimation for a registered experiment.
-
-    Loads data, dispatches to the correct estimator, logs to MLflow,
-    persists results to PostgreSQL, and returns the full estimate.
-    """
-    # Fetch experiment config
-    experiment = db.query(Experiment).filter(
-        Experiment.id == payload.experiment_id
-    ).first()
+def estimate(payload: EstimateRequest, db: Session = Depends(get_db_dependency)):
+    experiment = db.query(Experiment).filter(Experiment.id == payload.experiment_id).first()
     if not experiment:
         raise HTTPException(status_code=404, detail="Experiment not found")
 
-    # Mark as running
     experiment.status = "running"
     db.flush()
-
-    start_time = time.time()
-
+    start = time.time()
     try:
-        # Load data
-        logger.info(f"Loading data for experiment '{experiment.name}'...")
         df = load_criteo(sample_frac=experiment.sample_frac)
-
-        # Run estimator
-        logger.info(f"Running estimator: {experiment.estimator}")
-        results = _run_estimator(experiment, df)
-
-        duration = time.time() - start_time
-
-        # Log to MLflow
+        r = _run_estimator(experiment, df)
+        duration = time.time() - start
         mlflow_run_id = log_causal_run(
-            experiment_name=experiment.name,
-            estimator=experiment.estimator,
-            ate=results["ate"],
-            ci_lower=results["ci_lower"],
-            ci_upper=results["ci_upper"],
-            n_treated=results["n_treated"],
-            n_control=results["n_control"],
-            p_value=results["p_value"],
-            shap_importance=results["shap_importance"],
-            extra_params={"sample_frac": experiment.sample_frac},
-            extra_metrics={"duration_seconds": duration},
+            experiment_name=experiment.name, estimator=experiment.estimator,
+            ate=r["ate"], ci_lower=_num(r["ci_lower"]), ci_upper=_num(r["ci_upper"]),
+            n_treated=r["n_treated"], n_control=r["n_control"], p_value=_num(r["p_value"]),
+            shap_importance=r.get("feature_importance"),
+            extra_params={"sample_frac": experiment.sample_frac, "estimand": r["estimand"]},
+            extra_metrics={"duration_seconds": duration,
+                           **({"qini_coefficient": r["qini_coefficient"]}
+                              if _num(r.get("qini_coefficient")) is not None else {})},
         )
-
-        # Persist results to PostgreSQL
         run = EstimationRun(
-            id=uuid4(),
-            experiment_id=experiment.id,
-            mlflow_run_id=mlflow_run_id,
-            ate=results["ate"],
-            ci_lower=results["ci_lower"],
-            ci_upper=results["ci_upper"],
-            std_error=results["std_error"],
-            p_value=results["p_value"],
-            n_treated=results["n_treated"],
-            n_control=results["n_control"],
-            n_total=results["n_treated"] + results["n_control"],
-            shap_importance=results["shap_importance"],
-            segment_effects=results["segment_effects"],
-            estimator=experiment.estimator,
-            duration_seconds=duration,
-            metadata_={"sample_frac": experiment.sample_frac},
+            id=uuid4(), experiment_id=experiment.id, mlflow_run_id=mlflow_run_id,
+            ate=r["ate"], ci_lower=_num(r["ci_lower"]) or 0.0, ci_upper=_num(r["ci_upper"]) or 0.0,
+            std_error=_num(r["std_error"]), p_value=_num(r["p_value"]),
+            n_treated=r["n_treated"], n_control=r["n_control"],
+            n_total=r["n_treated"] + r["n_control"],
+            feature_importance=r.get("feature_importance"),
+            segment_effects=r.get("segment_effects"),
+            estimator=experiment.estimator, duration_seconds=duration,
+            metadata_={"sample_frac": experiment.sample_frac, "estimand": r["estimand"],
+                       "mean_cate": _num(r.get("mean_cate")),
+                       "qini_coefficient": _num(r.get("qini_coefficient")),
+                       "top_25pct_lift": _num(r.get("top_25pct_lift"))},
         )
         db.add(run)
-
         experiment.status = "done"
         db.flush()
         db.refresh(run)
-
-        logger.info(
-            f"Estimation complete | experiment='{experiment.name}' | "
-            f"ATE={results['ate']:.6f} | duration={duration:.1f}s"
-        )
-
-        # Build segment effects response
-        seg_response = None
-        if results["segment_effects"]:
-            seg_response = [
-                SegmentEffect(
-                    bin=int(s.get("_bin", i)),
-                    mean_cate=float(s["mean_cate"]),
-                    n=int(s["n"]),
-                    feature_mean=float(s["feature_mean"]),
-                    lift_vs_average=float(s["lift_vs_average"]),
-                )
-                for i, s in enumerate(results["segment_effects"])
-            ]
-
-        return EstimateResponse(
-            run_id=run.id,
-            experiment_id=experiment.id,
-            mlflow_run_id=mlflow_run_id,
-            estimator=experiment.estimator,
-            ate=results["ate"],
-            ci_lower=results["ci_lower"],
-            ci_upper=results["ci_upper"],
-            ci_width=results["ci_upper"] - results["ci_lower"],
-            p_value=results["p_value"],
-            n_treated=results["n_treated"],
-            n_control=results["n_control"],
-            n_total=results["n_treated"] + results["n_control"],
-            shap_importance=results["shap_importance"],
-            segment_effects=seg_response,
-            duration_seconds=duration,
-            created_at=run.created_at,
-        )
-
-    except Exception as e:
+    except Exception:
         experiment.status = "failed"
         db.flush()
-        logger.error(f"Estimation failed for '{experiment.name}': {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
+        # Details stay in the server log; the client gets a generic message.
+        logger.exception(f"Estimation failed for experiment '{experiment.name}'")
+        raise HTTPException(status_code=500, detail="Estimation failed; see server logs.")
+
+    lo, hi = _num(r["ci_lower"]), _num(r["ci_upper"])
+    return EstimateResponse(
+        run_id=run.id, experiment_id=experiment.id, mlflow_run_id=mlflow_run_id,
+        estimator=experiment.estimator, estimand=r["estimand"],
+        ate=r["ate"], ci_lower=lo, ci_upper=hi,
+        ci_width=(hi - lo) if lo is not None and hi is not None else None,
+        p_value=_num(r["p_value"]),
+        n_treated=r["n_treated"], n_control=r["n_control"],
+        n_total=r["n_treated"] + r["n_control"],
+        mean_cate=_num(r.get("mean_cate")), qini_coefficient=_num(r.get("qini_coefficient")),
+        top_25pct_lift=_num(r.get("top_25pct_lift")),
+        feature_importance=r.get("feature_importance"),
+        segment_effects=[SegmentEffect(**s) for s in r["segment_effects"]] if r.get("segment_effects") else None,
+        duration_seconds=duration, created_at=run.created_at,
+    )

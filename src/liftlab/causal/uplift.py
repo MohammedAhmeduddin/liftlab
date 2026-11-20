@@ -1,352 +1,161 @@
-# src/liftlab/causal/uplift.py
 """
-Uplift models for heterogeneous treatment effect estimation.
+Uplift (CATE) models: who responds to treatment?
 
-Three estimators:
-  - T-Learner  : separate outcome models per treatment arm (baseline)
-  - X-Learner  : improves T-Learner via cross-fitting (better with imbalanced treatment)
-  - CausalForest: non-parametric CATE estimator (the main model)
+- T-Learner:   separate outcome models per arm; CATE = difference.
+- X-Learner:   cross-imputed effects, weighted by propensity; better than
+               T when one arm is much smaller (Criteo: 85/15).
+- CausalForestDML: orthogonalized (double ML) honest forest.
 
-All return CATEResult with individual-level treatment effect estimates.
+Each model is FIT ON A TRAINING SPLIT and judged on a HELD-OUT split with
+the Qini coefficient and observed uplift in the top-ranked users
+(liftlab.causal.evaluation). In-sample CATE averages are not evidence:
+the model has already seen those outcomes.
+
+ATE uncertainty is not taken from these models; use
+liftlab.causal.estimators (difference in means / AIPW) for that.
 """
+
+from __future__ import annotations
+
 import warnings
-import numpy as np
-import pandas as pd
 from dataclasses import dataclass, field
-from loguru import logger
 from typing import Optional
 
-from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+import numpy as np
+import pandas as pd
+from econml.dml import CausalForestDML
+from econml.metalearners import TLearner, XLearner
+from loguru import logger
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from econml.metalearners import TLearner, XLearner
-from econml.dml import CausalForestDML
+from liftlab.causal.evaluation import evaluate_scores, observed_uplift_by_group, value_bins
+
+
+def _hgb(seed: int, max_iter: int = 100) -> HistGradientBoostingRegressor:
+    return HistGradientBoostingRegressor(max_iter=max_iter, max_depth=4, random_state=seed)
 
 
 @dataclass
 class CATEResult:
-    """Heterogeneous treatment effect estimation results."""
+    """Held-out evaluation of one CATE model."""
     method: str
-    cate: np.ndarray             # Individual-level CATE estimates
-    ate: float                   # Mean CATE = ATE
-    ate_lower: float             # 95% CI lower
-    ate_upper: float             # 95% CI upper
-    feature_cols: list[str]
-    shap_values: Optional[np.ndarray] = None
-    shap_explainer: Optional[object] = None
+    mean_cate: float                       # average predicted effect on the test split
+    test_cate: np.ndarray                  # predictions for the test split
+    evaluation: dict                       # Qini, top-k uplift, deciles (held-out)
+    n_train: int
+    n_test: int
+    feature_importance: Optional[dict[str, float]] = None
     metadata: dict = field(default_factory=dict)
 
-    def segment_effects(self, df: pd.DataFrame, col: str, n_bins: int = 4) -> pd.DataFrame:
-        """
-        Break down CATE by a feature column to find high-lift segments.
-        This is how you answer: 'Which customers respond most to treatment?'
-        """
-        df = df.copy()
-        df["_cate"] = self.cate
-        df["_bin"] = pd.qcut(df[col], q=n_bins, labels=False, duplicates="drop")
-        summary = (
-            df.groupby("_bin")
-            .agg(
-                mean_cate=("_cate", "mean"),
-                n=("_cate", "count"),
-                feature_mean=(col, "mean"),
-            )
-            .reset_index()
-        )
-        summary["lift_vs_average"] = summary["mean_cate"] / self.ate
-        return summary
+    def observed_segments(self, test_df: pd.DataFrame, col: str, n_bins: int = 4,
+                          treatment_col: str = "treatment",
+                          outcome_col: str = "conversion") -> pd.DataFrame:
+        """Observed (not predicted) uplift by value-quantile of ``col`` on held-out
+        data. Equal values share a bin, so tied features may give fewer bins."""
+        bins, edges = value_bins(test_df[col].to_numpy(), n_bins)
+        out = observed_uplift_by_group(test_df[outcome_col].to_numpy(float),
+                                       test_df[treatment_col].to_numpy(int), bins)
+        out["value_from"], out["value_to"] = edges[:-1][: len(out)], edges[1:][: len(out)]
+        return out
 
 
-# ---------------------------------------------------------------------------
-# T-Learner
-# ---------------------------------------------------------------------------
+class _BaseUplift:
+    method = "base"
 
-class TLearnerUplift:
-    """
-    T-Learner: train separate outcome models for treated and control.
-    CATE(x) = E[Y|X=x, T=1] - E[Y|X=x, T=0]
-
-    Weakness: with imbalanced treatment (85% treated here),
-    the control model has limited data and may be noisy.
-    """
-
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, test_size: float = 0.5):
         self.seed = seed
-        self.model = TLearner(
-            models=GradientBoostingRegressor(
-                n_estimators=100, max_depth=4, random_state=seed
-            )
-        )
+        self.test_size = test_size
         self.scaler = StandardScaler()
+        self.model = None
 
-    def fit_estimate(
+    def _build(self):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _importance(self, feature_cols: list[str]) -> Optional[dict[str, float]]:
+        return None
+
+    def split(self, df: pd.DataFrame, treatment_col: str):
+        return train_test_split(df, test_size=self.test_size, random_state=self.seed,
+                                stratify=df[treatment_col])
+
+    def fit_evaluate(
         self,
         df: pd.DataFrame,
         feature_cols: list[str],
         treatment_col: str = "treatment",
         outcome_col: str = "conversion",
-    ) -> CATEResult:
-        logger.info("Fitting T-Learner...")
-        X = self.scaler.fit_transform(df[feature_cols])
-        T = df[treatment_col].values.ravel()
-        Y = df[outcome_col].values.astype(float).ravel()
-
+    ) -> tuple[CATEResult, pd.DataFrame]:
+        """Fit on a stratified train split, evaluate on the held-out split.
+        Returns (result, test_df) so callers can inspect segments."""
+        train, test = self.split(df, treatment_col)
+        Xtr = self.scaler.fit_transform(train[feature_cols].to_numpy(float))
+        Xte = self.scaler.transform(test[feature_cols].to_numpy(float))
+        ttr = train[treatment_col].to_numpy(int)
+        ytr = train[outcome_col].to_numpy(float)
+        self.model = self._build()
+        logger.info(f"Fitting {self.method} on {len(train):,} rows, evaluating on {len(test):,}")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.model.fit(Y, T, X=X)
-            cate = self.model.effect(X).ravel()
-
-        ate = float(cate.mean())
-
-        # Bootstrap CI on ATE
-        rng = np.random.default_rng(self.seed)
-        boot_ates = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            for _ in range(100):
-                idx = rng.choice(len(X), len(X), replace=True)
-                boot_ates.append(self.model.effect(X[idx]).mean())
-
-        ci_lower = float(np.percentile(boot_ates, 2.5))
-        ci_upper = float(np.percentile(boot_ates, 97.5))
-
-        logger.info(f"T-Learner ATE={ate:.6f} | CI=[{ci_lower:.6f}, {ci_upper:.6f}]")
-
-        return CATEResult(
-            method="T-Learner",
-            cate=cate,
-            ate=ate,
-            ate_lower=ci_lower,
-            ate_upper=ci_upper,
-            feature_cols=feature_cols,
-            metadata={"n_obs": len(df)},
+            self.model.fit(ytr, ttr, X=Xtr)
+            cate = np.asarray(self.model.effect(Xte)).ravel()
+        evaluation = evaluate_scores(test[outcome_col].to_numpy(float),
+                                     test[treatment_col].to_numpy(int), cate)
+        result = CATEResult(
+            method=self.method, mean_cate=float(cate.mean()), test_cate=cate,
+            evaluation=evaluation, n_train=len(train), n_test=len(test),
+            feature_importance=self._importance(feature_cols),
         )
+        logger.info(f"{self.method}: Qini={evaluation['qini_coefficient']:.3f} "
+                    f"top-25% lift={evaluation['top_25pct']['lift_vs_overall']:.2f}x")
+        return result, test
 
 
-# ---------------------------------------------------------------------------
-# X-Learner
-# ---------------------------------------------------------------------------
+class TLearnerUplift(_BaseUplift):
+    method = "T-Learner"
 
-class XLearnerUplift:
-    """
-    X-Learner: improvement over T-Learner via cross-fitting.
-    Better when treatment groups are imbalanced (our case: 85/15 split).
-
-    Steps:
-    1. Fit outcome models per arm (like T-Learner)
-    2. Compute imputed treatment effects via cross-prediction
-    3. Fit CATE models on imputed effects
-    4. Combine using propensity-weighted average
-    """
-
-    def __init__(self, seed: int = 42):
-        self.seed = seed
-        self.model = XLearner(
-            models=GradientBoostingRegressor(
-                n_estimators=100, max_depth=4, random_state=seed
-            ),
-            propensity_model=LogisticRegression(max_iter=1000, random_state=seed),
-        )
-        self.scaler = StandardScaler()
-
-    def fit_estimate(
-        self,
-        df: pd.DataFrame,
-        feature_cols: list[str],
-        treatment_col: str = "treatment",
-        outcome_col: str = "conversion",
-    ) -> CATEResult:
-        logger.info("Fitting X-Learner...")
-        X = self.scaler.fit_transform(df[feature_cols])
-        T = df[treatment_col].values.ravel()
-        Y = df[outcome_col].values.astype(float).ravel()
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.model.fit(Y, T, X=X)
-            cate = self.model.effect(X).ravel()
-
-        ate = float(cate.mean())
-
-        rng = np.random.default_rng(self.seed)
-        boot_ates = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            for _ in range(100):
-                idx = rng.choice(len(X), len(X), replace=True)
-                boot_ates.append(self.model.effect(X[idx]).mean())
-
-        ci_lower = float(np.percentile(boot_ates, 2.5))
-        ci_upper = float(np.percentile(boot_ates, 97.5))
-
-        logger.info(f"X-Learner ATE={ate:.6f} | CI=[{ci_lower:.6f}, {ci_upper:.6f}]")
-
-        return CATEResult(
-            method="X-Learner",
-            cate=cate,
-            ate=ate,
-            ate_lower=ci_lower,
-            ate_upper=ci_upper,
-            feature_cols=feature_cols,
-            metadata={"n_obs": len(df)},
-        )
+    def _build(self):
+        return TLearner(models=_hgb(self.seed))
 
 
-# ---------------------------------------------------------------------------
-# Causal Forest DML (main model)
-# ---------------------------------------------------------------------------
+class XLearnerUplift(_BaseUplift):
+    method = "X-Learner"
 
-class CausalForestUplift:
-    """
-    CausalForestDML: the most robust CATE estimator.
+    def _build(self):
+        return XLearner(models=_hgb(self.seed),
+                        propensity_model=LogisticRegression(max_iter=1000))
 
-    Uses Double Machine Learning (DML) to:
-    1. Partial out the effect of X on Y (residualize outcome)
-    2. Partial out the effect of X on T (residualize treatment)
-    3. Fit a causal forest on the residuals → clean CATE estimates
 
-    This removes the influence of confounders non-parametrically,
-    making it robust to model misspecification.
-    """
+class CausalForestUplift(_BaseUplift):
+    method = "Causal Forest (DML)"
 
-    def __init__(self, n_estimators: int = 100, seed: int = 42):
-        self.seed = seed
+    def __init__(self, n_estimators: int = 100, seed: int = 42, test_size: float = 0.5):
+        super().__init__(seed, test_size)
         self.n_estimators = n_estimators
-        self.scaler = StandardScaler()
-        self._X_scaled: Optional[np.ndarray] = None
-        self.model: Optional[CausalForestDML] = None
 
-    def _build_model(self) -> CausalForestDML:
+    def _build(self):
         return CausalForestDML(
-            n_estimators=self.n_estimators,
-            min_samples_leaf=10,
-            max_depth=5,
-            random_state=self.seed,
-            cv=3,
-            discrete_treatment=True,
-            model_y=GradientBoostingRegressor(
-                n_estimators=50, max_depth=3, random_state=self.seed
-            ),
-            model_t=GradientBoostingClassifier(
-                n_estimators=50, max_depth=3, random_state=self.seed
-            ),
+            n_estimators=self.n_estimators, min_samples_leaf=50, max_depth=6,
+            discrete_treatment=True, cv=2, random_state=self.seed,
+            model_y=_hgb(self.seed, 50),
+            model_t=HistGradientBoostingClassifier(max_iter=50, max_depth=3, random_state=self.seed),
         )
 
-    def fit_estimate(
-        self,
-        df: pd.DataFrame,
-        feature_cols: list[str],
-        treatment_col: str = "treatment",
-        outcome_col: str = "conversion",
-    ) -> CATEResult:
-        logger.info(f"Fitting CausalForestDML on {len(df):,} rows...")
+    def _importance(self, feature_cols: list[str]) -> Optional[dict[str, float]]:
+        """Split-based importance of features for effect heterogeneity."""
+        imp = getattr(self.model, "feature_importances_", None)
+        if imp is None:
+            return None
+        imp = np.asarray(imp, dtype=float)
+        if imp.sum() > 0:
+            imp = imp / imp.sum()
+        return dict(sorted(zip(feature_cols, imp.round(4).tolist()), key=lambda kv: -kv[1]))
 
-        X = self.scaler.fit_transform(df[feature_cols])
-        T = df[treatment_col].values.astype(float).ravel()
-        Y = df[outcome_col].values.astype(float).ravel()
 
-        self._X_scaled = X
-        self.model = self._build_model()
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.model.fit(Y, T, X=X)
-
-        # Point estimates
-        cate = self.model.effect(X).ravel()
-        ate = float(cate.mean())
-
-        # Confidence intervals from the forest's built-in inference
-        try:
-            ate_interval = self.model.ate_interval(X, T0=0, T1=1)
-            ci_lower = float(ate_interval[0])
-            ci_upper = float(ate_interval[1])
-        except Exception as e:
-            logger.warning(f"Built-in CI failed ({e}) — falling back to bootstrap")
-            rng = np.random.default_rng(self.seed)
-            boot_ates = []
-            for _ in range(100):
-                idx = rng.choice(len(X), len(X), replace=True)
-                boot_ates.append(self.model.effect(X[idx]).mean())
-            ci_lower = float(np.percentile(boot_ates, 2.5))
-            ci_upper = float(np.percentile(boot_ates, 97.5))
-
-        logger.info(
-            f"CausalForest ATE={ate:.6f} | CI=[{ci_lower:.6f}, {ci_upper:.6f}]"
-        )
-
-        # SHAP values — capped at 2K rows for speed
-        shap_arr = None
-        logger.info("Computing SHAP values on Causal Forest...")
-        try:
-            shap_sample = X[:2000]
-            shap_values = self.model.shap_values(shap_sample)
-
-            if isinstance(shap_values, dict):
-                shap_arr = list(shap_values.values())[0]
-                if isinstance(shap_arr, dict):
-                    shap_arr = list(shap_arr.values())[0]
-            else:
-                shap_arr = shap_values
-
-            # Unwrap SHAP Explanation object if needed
-            if hasattr(shap_arr, "values"):
-                shap_arr = shap_arr.values
-
-            if isinstance(shap_arr, np.ndarray) and shap_arr.ndim == 3:
-                shap_arr = shap_arr[:, :, 0]
-
-            logger.info("SHAP values computed ✅")
-        except Exception as e:
-            logger.warning(f"SHAP computation failed: {e} — skipping")
-            shap_arr = None
-
-        return CATEResult(
-            method="CausalForest",
-            cate=cate,
-            ate=ate,
-            ate_lower=ci_lower,
-            ate_upper=ci_upper,
-            feature_cols=feature_cols,
-            shap_values=shap_arr,
-            metadata={
-                "n_estimators": self.n_estimators,
-                "n_obs": len(df),
-            },
-        )
-
-    def feature_importance(self, feature_cols: list[str]) -> pd.DataFrame:
-        """SHAP-based feature importance for treatment effect heterogeneity."""
-        if self._X_scaled is None or self.model is None:
-            raise RuntimeError("Call fit_estimate() first.")
-
-        try:
-            shap_sample = self._X_scaled[:2000]
-            shap_values = self.model.shap_values(shap_sample)
-
-            if isinstance(shap_values, dict):
-                shap_arr = list(shap_values.values())[0]
-                if isinstance(shap_arr, dict):
-                    shap_arr = list(shap_arr.values())[0]
-            else:
-                shap_arr = shap_values
-
-            # Unwrap SHAP Explanation object if needed
-            if hasattr(shap_arr, "values"):
-                shap_arr = shap_arr.values
-
-            if isinstance(shap_arr, np.ndarray) and shap_arr.ndim == 3:
-                shap_arr = shap_arr[:, :, 0]
-
-            importance = np.abs(shap_arr).mean(axis=0)
-
-        except Exception as e:
-            logger.warning(f"SHAP feature importance failed: {e} — using uniform importance")
-            importance = np.ones(len(feature_cols)) / len(feature_cols)
-
-        return (
-            pd.DataFrame({"feature": feature_cols, "shap_importance": importance})
-            .sort_values("shap_importance", ascending=False)
-            .reset_index(drop=True)
-        )
+ESTIMATORS = {
+    "tlearner": TLearnerUplift,
+    "xlearner": XLearnerUplift,
+    "causalforest": CausalForestUplift,
+}

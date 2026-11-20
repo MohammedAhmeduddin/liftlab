@@ -1,6 +1,5 @@
 # tests/test_config.py
 """Config and settings tests."""
-import os
 from liftlab.config import get_settings
 
 

@@ -3,6 +3,9 @@
 MLflow logging utilities for causal estimation runs.
 MLflow is optional — if unavailable, estimation continues without logging.
 """
+import urllib.request
+from urllib.parse import urlparse
+
 import mlflow
 from loguru import logger
 from liftlab.config import get_settings
@@ -10,11 +13,31 @@ from liftlab.config import get_settings
 settings = get_settings()
 
 
+def _server_reachable(uri: str, timeout: float = 2.0) -> bool:
+    """Fast health probe for http(s) tracking servers.
+
+    Asks the server's /health endpoint and accepts only HTTP 200. An open
+    port is not enough: on macOS, AirPlay Receiver answers on port 5000 with
+    403, and the MLflow client then retries for about four minutes.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme not in ("http", "https"):
+        return True  # file:, sqlite: etc. need no server
+    try:
+        with urllib.request.urlopen(uri.rstrip("/") + "/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def setup_mlflow() -> bool:
     """
     Configure MLflow. Returns True if reachable, False otherwise.
     Never raises — MLflow is optional infrastructure.
     """
+    if not _server_reachable(settings.mlflow_tracking_uri):
+        logger.warning(f"MLflow server not reachable at {settings.mlflow_tracking_uri}")
+        return False
     try:
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         mlflow.set_experiment(settings.mlflow_experiment_name)
@@ -58,21 +81,16 @@ def log_causal_run(
             })
 
             # Core causal metrics
-            metrics = {
-                "ate": ate,
-                "ci_lower": ci_lower,
-                "ci_upper": ci_upper,
-                "ci_width": ci_upper - ci_lower,
-                **(extra_metrics or {}),
-            }
-            if p_value is not None:
-                metrics["p_value"] = p_value
-            mlflow.log_metrics(metrics)
+            metrics = {"ate": ate, "ci_lower": ci_lower, "ci_upper": ci_upper,
+                       "p_value": p_value, **(extra_metrics or {})}
+            if ci_lower is not None and ci_upper is not None:
+                metrics["ci_width"] = ci_upper - ci_lower
+            mlflow.log_metrics({k: v for k, v in metrics.items() if v is not None})
 
-            # SHAP importance as individual metrics
+            # Feature importance for effect heterogeneity, one metric per feature
             if shap_importance:
                 shap_metrics = {
-                    f"shap_{feat}": float(imp)
+                    f"importance_{feat}": float(imp)
                     for feat, imp in shap_importance.items()
                 }
                 mlflow.log_metrics(shap_metrics)
