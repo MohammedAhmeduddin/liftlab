@@ -3,7 +3,7 @@
 MLflow logging utilities for causal estimation runs.
 MLflow is optional — if unavailable, estimation continues without logging.
 """
-import socket
+import urllib.request
 from urllib.parse import urlparse
 
 import mlflow
@@ -14,16 +14,19 @@ settings = get_settings()
 
 
 def _server_reachable(uri: str, timeout: float = 2.0) -> bool:
-    """Fast TCP probe for http(s) tracking servers. Without it, the MLflow
-    client retries for minutes when the server is down, stalling requests."""
+    """Fast health probe for http(s) tracking servers.
+
+    Asks the server's /health endpoint and accepts only HTTP 200. An open
+    port is not enough: on macOS, AirPlay Receiver answers on port 5000 with
+    403, and the MLflow client then retries for about four minutes.
+    """
     parsed = urlparse(uri)
     if parsed.scheme not in ("http", "https"):
         return True  # file:, sqlite: etc. need no server
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        with socket.create_connection((parsed.hostname, port), timeout=timeout):
-            return True
-    except OSError:
+        with urllib.request.urlopen(uri.rstrip("/") + "/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
         return False
 
 

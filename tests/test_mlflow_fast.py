@@ -1,6 +1,8 @@
 """MLflow logging: fast failure when the server is down, real logging to a file store."""
 
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import mlflow
 
@@ -27,3 +29,40 @@ def test_logs_run_to_local_sqlite_store(monkeypatch, tmp_path):
     assert run.data.metrics["ate"] == 0.001
     assert "ci_width" not in run.data.metrics
     assert run.data.metrics["importance_f8"] == 0.4
+
+
+def _serve(status: int):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_open_port_that_is_not_mlflow_is_unreachable(monkeypatch):
+    """e.g. macOS AirPlay Receiver on :5000 answers 403; must not stall."""
+    server = _serve(403)
+    try:
+        uri = f"http://127.0.0.1:{server.server_port}"
+        monkeypatch.setattr(mlflow_logger.settings, "mlflow_tracking_uri", uri)
+        start = time.perf_counter()
+        assert mlflow_logger.setup_mlflow() is False
+        assert mlflow_logger.log_causal_run("x", "aipw", 0.1, 0.0, 0.2, 10, 5) is None
+        assert time.perf_counter() - start < 5
+    finally:
+        server.shutdown()
+
+
+def test_healthy_server_is_reachable():
+    server = _serve(200)
+    try:
+        assert mlflow_logger._server_reachable(f"http://127.0.0.1:{server.server_port}/")
+    finally:
+        server.shutdown()
