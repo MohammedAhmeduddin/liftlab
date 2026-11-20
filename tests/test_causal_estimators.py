@@ -129,6 +129,20 @@ class TestPSM:
         assert covers(PropensityScoreMatching().estimate(conf, FEATURES), truth)
         assert covers(aipw(conf, FEATURES, estimand="ATT"), truth)
 
+    def test_tied_scores_spread_matches_across_controls(self):
+        """Heavily tied features give tied propensity scores; without random
+        tie-breaking one control was reused ~147,000 times."""
+        d = simulate_rct(60_000, base_rate=0.05, base_effect=0.02, seed=5)
+        rng = np.random.default_rng(1)
+        for f in FEATURES:
+            d[f] = np.where(rng.random(len(d)) < 0.8, 0.0, d[f]).round(1)
+        truth = d.loc[d.treatment == 1, "_true_cate"].mean()
+        est = PropensityScoreMatching().estimate(d, FEATURES)
+        assert est.metadata["max_control_reuse"] < 100
+        assert est.metadata["max_smd_after"] < 0.1
+        assert covers(est, truth)
+        assert est.ci_upper - est.ci_lower < 0.05
+
     def test_keeps_nearly_all_treated_units(self, rct):
         """Matching with replacement: unlike greedy 1:1 without replacement,
         treated units are not dropped just because controls are scarce."""

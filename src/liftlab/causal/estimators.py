@@ -230,10 +230,28 @@ class PropensityScoreMatching:
         p = np.clip(model.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
         return np.log(p / (1 - p))
 
+    def _break_ties(self, lp: np.ndarray) -> np.ndarray:
+        """Random tie-breaking among equal propensity scores.
+
+        With heavily tied features (Criteo) many units share one score, and a
+        nearest-neighbour search then returns the SAME control for every tied
+        treated unit: one control reused 100,000+ times, a meaningless
+        estimate and an exploding variance. A jitter smaller than a quarter of
+        the smallest gap between distinct scores reorders ties at random
+        without ever changing which score is nearer.
+        """
+        distinct = np.unique(lp)
+        if len(distinct) == len(lp):
+            return lp
+        eps = 0.25 * float(np.diff(distinct).min()) if len(distinct) > 1 else 1.0
+        rng = np.random.default_rng(self.seed)
+        return lp + rng.uniform(-eps, eps, len(lp))
+
     def _att(self, X: np.ndarray, t: np.ndarray, y: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
         """Returns (ATT, matched treated indices, matched control indices)."""
         lp = self._logit_propensity(X, t)
         caliper = self.caliper_sd * lp.std()
+        lp = self._break_ties(lp)
         ti, ci = np.flatnonzero(t == 1), np.flatnonzero(t == 0)
         nn = NearestNeighbors(n_neighbors=1).fit(lp[ci].reshape(-1, 1))
         dist, pos = nn.kneighbors(lp[ti].reshape(-1, 1))
@@ -273,7 +291,8 @@ class PropensityScoreMatching:
         smd_before = standardized_mean_differences(frame[t == 1], frame[t == 0], feature_cols)
         smd_after = standardized_mean_differences(frame.iloc[mt], frame.iloc[mc], feature_cols)
         n_treated = int((t == 1).sum())
-        logger.info(f"PSM ATT={att:.6f} CI=[{lo:.6f}, {hi:.6f}] matched {len(mt)}/{n_treated}")
+        logger.info(f"PSM ATT={att:.6f} CI=[{lo:.6f}, {hi:.6f}] matched {len(mt)}/{n_treated} "
+                    f"max control reuse {int(k.max())}")
         return CausalEstimate(
             method="Propensity score matching", estimand="ATT",
             ate=att, ci_lower=float(lo), ci_upper=float(hi), std_error=se,
