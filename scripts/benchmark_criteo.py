@@ -33,7 +33,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from liftlab.causal.estimators import PropensityScoreMatching, aipw, difference_in_means  # noqa: E402
-from liftlab.causal.evaluation import observed_uplift_by_group  # noqa: E402
+from liftlab.causal.evaluation import observed_uplift_by_group, value_bins  # noqa: E402
 from liftlab.causal.refutation import (  # noqa: E402
     placebo_treatment, random_common_cause, subset_stability,
 )
@@ -107,14 +107,23 @@ def main(argv=None) -> int:
               f"relative lift {r['relative_lift']:+.1%}")
     rep.add("rct_ground_truth", truth, time.perf_counter() - t0)
 
-    t0 = section("2. Observed uplift by f8 quartile (all rows)")
-    f8_q = full["f8"].rank(method="first")
-    f8_bins = (np.ceil(f8_q / len(full) * 4) - 1).astype(int).to_numpy()
-    seg = {y: observed_uplift_by_group(full[y].to_numpy(float), full.treatment.to_numpy(int),
-                                       f8_bins).to_dict(orient="records") for y in args.outcomes}
-    for y, rows in seg.items():
-        print(f"  {y}: " + "  ".join(f"Q{r['group'] + 1} {r['lift_vs_overall']:.2f}x" for r in rows))
-    rep.add("f8_quartiles_observed", seg, time.perf_counter() - t0)
+    t0 = section("2. Observed uplift by f8 value group (all rows)")
+    # Bins on VALUES: 52% of users share one f8 value, and the file is stored
+    # ordered by treatment, so rank-based quartiles would split ties by file
+    # position and put treated and control users in different groups.
+    f8_bins, f8_edges = value_bins(full["f8"].to_numpy(), 4)
+    seg = {"edges": f8_edges, "n_distinct_values": int(full["f8"].nunique()),
+           "top_value_share": float(full["f8"].value_counts(normalize=True).iloc[0])}
+    for y in args.outcomes:
+        rows = observed_uplift_by_group(full[y].to_numpy(float), full.treatment.to_numpy(int), f8_bins)
+        rows["value_from"], rows["value_to"] = f8_edges[:-1][: len(rows)], f8_edges[1:][: len(rows)]
+        seg[y] = rows.to_dict(orient="records")
+        print(f"  {y}: " + "  ".join(
+            f"[{r['value_from']:.3f}, {r['value_to']:.3f}] n={r['n']:,} {r['lift_vs_overall']:.2f}x"
+            for r in seg[y]))
+    print(f"  ({seg['n_distinct_values']:,} distinct f8 values; most common covers "
+          f"{seg['top_value_share']:.1%} of users)")
+    rep.add("f8_groups_observed", seg, time.perf_counter() - t0)
 
     sample = full.sample(frac=args.model_frac, random_state=args.seed).reset_index(drop=True)
     del full

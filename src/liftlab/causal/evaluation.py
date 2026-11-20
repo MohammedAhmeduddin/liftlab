@@ -10,6 +10,13 @@ If the model is right, targeting its top users beats targeting at random.
 - qini_curve / qini_coefficient: incremental outcomes as more users are
   targeted in model order, minus what random targeting would get
 - uplift_at_k: observed effect in the top k% vs the whole population
+
+Ties: Criteo is stored ordered by treatment (the first quarter of the file
+is 100% treated) and some features take few values (52% of users share one
+f8 value). Breaking ties by row order would therefore put treated and
+control users into different groups. Model scores are ranked with RANDOM
+tie-breaking (rank_order / score_groups); features are binned by VALUE so
+equal values always share a group (value_bins).
 """
 
 from __future__ import annotations
@@ -19,6 +26,27 @@ import pandas as pd
 from scipy import stats
 
 Z95 = stats.norm.ppf(0.975)
+
+
+def rank_order(score: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Indices from highest to lowest score; ties broken at random (seeded),
+    never by row order."""
+    tiebreak = np.random.default_rng(seed).random(len(score))
+    return np.lexsort((tiebreak, -np.asarray(score, dtype=float)))
+
+
+def score_groups(score: np.ndarray, n_groups: int, seed: int = 0) -> np.ndarray:
+    """Equal-size groups by score, 0 = highest; random tie-breaking."""
+    pos = np.empty(len(score), dtype=int)
+    pos[rank_order(score, seed)] = np.arange(len(score))
+    return np.minimum(pos * n_groups // len(score), n_groups - 1)
+
+
+def value_bins(values, n_bins: int) -> tuple[np.ndarray, list[float]]:
+    """Quantile bins on VALUES: equal values always share a bin, so heavily
+    tied features give fewer / unequal bins. Returns (labels, edges)."""
+    labels, edges = pd.qcut(pd.Series(values), n_bins, labels=False, retbins=True, duplicates="drop")
+    return labels.to_numpy(dtype=int), [float(e) for e in edges]
 
 
 def _diff_in_means(y: np.ndarray, t: np.ndarray) -> tuple[float, float, int, int]:
@@ -46,13 +74,13 @@ def observed_uplift_by_group(
     return out
 
 
-def qini_curve(y: np.ndarray, t: np.ndarray, score: np.ndarray, n_points: int = 100):
+def qini_curve(y: np.ndarray, t: np.ndarray, score: np.ndarray, n_points: int = 100, seed: int = 0):
     """Returns (fraction targeted, incremental outcomes, random baseline).
 
     Incremental outcomes after targeting the top-k users (Radcliffe):
         Q(k) = Y_T(k) − Y_C(k) · N_T(k) / N_C(k)
     """
-    order = np.argsort(-score, kind="stable")
+    order = rank_order(score, seed)
     y, t = y[order].astype(float), t[order].astype(int)
     cum_t, cum_c = np.cumsum(t), np.cumsum(1 - t)
     cum_yt, cum_yc = np.cumsum(y * t), np.cumsum(y * (1 - t))
@@ -78,7 +106,7 @@ def qini_coefficient(y: np.ndarray, t: np.ndarray, score: np.ndarray) -> float:
 def uplift_at_k(y: np.ndarray, t: np.ndarray, score: np.ndarray, k: float) -> dict:
     """Observed effect among the top ``k`` fraction by score, vs everyone."""
     n_top = max(int(round(k * len(y))), 2)
-    top = np.argsort(-score, kind="stable")[:n_top]
+    top = rank_order(score)[:n_top]
     est, se, n1, n0 = _diff_in_means(y[top], t[top])
     overall, overall_se, _, _ = _diff_in_means(y, t)
     return {
@@ -91,8 +119,7 @@ def uplift_at_k(y: np.ndarray, t: np.ndarray, score: np.ndarray, k: float) -> di
 
 def evaluate_scores(y: np.ndarray, t: np.ndarray, score: np.ndarray) -> dict:
     """Standard report for one model's held-out scores."""
-    deciles = pd.qcut(pd.Series(score).rank(method="first"), 10, labels=False).to_numpy()
-    by_decile = observed_uplift_by_group(y, t, 9 - deciles)  # group 0 = highest predicted
+    by_decile = observed_uplift_by_group(y, t, score_groups(score, 10))  # group 0 = highest predicted
     return {
         "qini_coefficient": qini_coefficient(y, t, score),
         "top_10pct": uplift_at_k(y, t, score, 0.10),

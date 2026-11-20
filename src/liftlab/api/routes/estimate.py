@@ -16,14 +16,13 @@ import time
 from typing import Any, Optional
 from uuid import uuid4
 
-import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger
 from sqlalchemy.orm import Session
 
 from liftlab.api.schemas import EstimateRequest, EstimateResponse, SegmentEffect
 from liftlab.causal.estimators import PropensityScoreMatching, aipw, difference_in_means
-from liftlab.causal.evaluation import observed_uplift_by_group
+from liftlab.causal.evaluation import observed_uplift_by_group, score_groups
 from liftlab.causal.uplift import ESTIMATORS as CATE_ESTIMATORS
 from liftlab.data.loaders import load_criteo
 from liftlab.db.models import EstimationRun, Experiment
@@ -63,7 +62,7 @@ def _run_estimator(experiment: Experiment, df) -> dict:
 
     model = CATE_ESTIMATORS[name](seed=42)
     res, test = model.fit_evaluate(df, features, t_col, y_col)
-    quartile = np.minimum((np.argsort(np.argsort(-res.test_cate)) * 4) // len(test), 3)
+    quartile = score_groups(res.test_cate, 4)  # 0 = highest predicted; random tie-breaking
     segments = observed_uplift_by_group(test[y_col].to_numpy(float), test[t_col].to_numpy(int), quartile)
     dm = difference_in_means(df, t_col, y_col)
     return {

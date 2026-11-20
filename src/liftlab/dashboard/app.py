@@ -249,10 +249,12 @@ elif page == "📈 Results":
                  for m in models.values() if isinstance(m, dict)]
         st.dataframe(pd.DataFrame(table).round(3), width="stretch", hide_index=True)
 
-        st.subheader("Observed uplift by f8 quartile (all rows, no model)")
-        f8 = pd.DataFrame(bench["f8_quartiles_observed"]["conversion"])
-        st.dataframe(f8[["group", "n", "uplift", "ci_lower", "ci_upper", "lift_vs_overall"]].round(6),
-                     width="stretch", hide_index=True)
+        f8_section = bench.get("f8_groups_observed")
+        if f8_section:
+            st.subheader("Observed uplift by f8 value group (all rows, no model)")
+            f8 = pd.DataFrame(f8_section["conversion"])
+            st.dataframe(f8[["value_from", "value_to", "n", "uplift", "ci_lower", "ci_upper",
+                             "lift_vs_overall"]].round(6), width="stretch", hide_index=True)
 
 elif page == "🔍 Drift Monitor":
     st.title("🔍 Population Drift Monitor")

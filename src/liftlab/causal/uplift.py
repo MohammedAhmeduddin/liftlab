@@ -31,7 +31,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from liftlab.causal.evaluation import evaluate_scores, observed_uplift_by_group
+from liftlab.causal.evaluation import evaluate_scores, observed_uplift_by_group, value_bins
 
 
 def _hgb(seed: int, max_iter: int = 100) -> HistGradientBoostingRegressor:
@@ -53,10 +53,13 @@ class CATEResult:
     def observed_segments(self, test_df: pd.DataFrame, col: str, n_bins: int = 4,
                           treatment_col: str = "treatment",
                           outcome_col: str = "conversion") -> pd.DataFrame:
-        """Observed (not predicted) uplift by quantile of ``col`` on held-out data."""
-        bins = pd.qcut(test_df[col].rank(method="first"), n_bins, labels=False).to_numpy()
-        return observed_uplift_by_group(test_df[outcome_col].to_numpy(float),
-                                        test_df[treatment_col].to_numpy(int), bins)
+        """Observed (not predicted) uplift by value-quantile of ``col`` on held-out
+        data. Equal values share a bin, so tied features may give fewer bins."""
+        bins, edges = value_bins(test_df[col].to_numpy(), n_bins)
+        out = observed_uplift_by_group(test_df[outcome_col].to_numpy(float),
+                                       test_df[treatment_col].to_numpy(int), bins)
+        out["value_from"], out["value_to"] = edges[:-1][: len(out)], edges[1:][: len(out)]
+        return out
 
 
 class _BaseUplift:

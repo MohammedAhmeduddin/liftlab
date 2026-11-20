@@ -167,7 +167,7 @@ def test_benchmark_script_end_to_end(tmp_path):
     assert bench.main(["--data", str(data), "--out", str(out), "--model-frac", "0.5",
                        "--cf-trees", "8", "--psm-bootstrap", "3"]) == 0
     sections = json.loads(out.read_text())["sections"]
-    assert set(sections) == {"data", "rct_ground_truth", "f8_quartiles_observed", "sample_estimators",
+    assert set(sections) == {"data", "rct_ground_truth", "f8_groups_observed", "sample_estimators",
                              "confounded_test", "cate_models_holdout", "refutation"}
     assert sections["data"]["rows"] == 20_000
     truth = sections["rct_ground_truth"]["conversion"]
