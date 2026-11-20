@@ -1,339 +1,220 @@
-# 🧪 LiftLab — Production Causal Inference Engine
+# LiftLab: causal inference on 14M real ad-campaign users
 
-> **Distinguish genuine causal lift from correlation, seasonal effects, and selection bias — at production scale.**
+[![CI](https://github.com/MohammedAhmeduddin/liftlab/actions/workflows/ci.yml/badge.svg)](https://github.com/MohammedAhmeduddin/liftlab/actions/workflows/ci.yml)
+![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)
+![Tests](https://img.shields.io/badge/tests-99%20passed-brightgreen.svg)
+![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen.svg)
 
-[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.111-green.svg)](https://fastapi.tiangolo.com)
-[![EconML](https://img.shields.io/badge/EconML-0.15-orange.svg)](https://econml.azurewebsites.net)
-[![Tests](https://img.shields.io/badge/tests-53%20passed-brightgreen.svg)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-83%25-brightgreen.svg)](htmlcov/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+LiftLab measures how much an ad campaign **caused** users to visit and convert, and **which users** it moved. It runs on the full [Criteo Uplift v2.1](https://ailab.criteo.com/criteo-uplift-prediction-dataset/) dataset: 13,979,592 users, 85% shown ads, 15% held out.
 
----
-
-## The $2M Problem
-
-E-commerce growth teams run 50+ promotions per quarter. Standard A/B tools return p-values — but when randomization is impossible, observational data is confounded, or populations shift between experiments, those p-values are measuring **correlation, not causation**.
-
-The result: teams scale promotions that show positive correlation but **zero true causal lift**, misallocating millions in promotion spend.
-
-LiftLab solves this with a production-grade causal inference engine that combines rigorous identification strategies, heterogeneous treatment effect estimation, and automated drift detection.
+Every estimator is first checked against simulated data where the true effect is known, then run on Criteo. The benchmark found a problem in the data itself: the "randomized" groups are not quite balanced. That changes the headline answer, and it is the main finding below.
 
 ---
 
-## Live Demo
+## Key results
 
-| Service                    | URL                                               | Description                      |
-| -------------------------- | ------------------------------------------------- | -------------------------------- |
-| 🎨 **Streamlit Dashboard** | [localhost:8501](http://localhost:8501)           | Growth team experiment hub       |
-| 🚀 **FastAPI Docs**        | [localhost:8080/docs](http://localhost:8080/docs) | Interactive API documentation    |
-| 📊 **MLflow UI**           | [localhost:5001](http://localhost:5001)           | Experiment tracking & versioning |
+All numbers come from `results/criteo_benchmark.json`, produced by `python scripts/benchmark_criteo.py` on all 13,979,592 rows (2.6 min on a MacBook Pro).
+
+### 1. The randomization is slightly broken, and it matters
+
+Criteo describes this data as a randomized trial, so the textbook answer is the treated-minus-control difference. LiftLab checks that assumption before trusting it:
+
+| Check | Result | Under a clean randomization |
+|---|---|---|
+| Can a model predict who was treated? (held-out AUC) | **0.5101** | ≤ 0.5014 (max over 20 shuffled-label runs) |
+| Largest feature difference between groups (\|SMD\|, f3) | **0.0488** | ~0.0008 (noise level at this size): **65× larger** |
+| AIPW vs raw difference, 5 independent 2% samples (visit) | AIPW **3–5 SE lower every time** | agree within ~1 SE |
+
+The imbalance is tiny by usual standards (SMD < 0.1). But at 14M rows it is real, and the features that differ also predict visits. So the raw difference is biased, and the reference is **cross-fitted AIPW** (doubly robust), which adjusts for the features:
+
+| Outcome | Raw difference (biased) | **AIPW reference** (95% CI) | Relative lift |
+|---|---|---|---|
+| Conversion | 0.001152 (+59.4%) | **0.000997** [0.000930, 0.001064] | **+51.4%** |
+| Visit | 0.010342 (+27.1%) | **0.007459** [0.007210, 0.007709] | **+19.5%** |
+
+**The raw comparison overstates the visit effect by 39%, and the two confidence intervals do not overlap.**
+
+### 2. Who responds: f8 splits users into responders and non-responders
+
+`f8` has 3,743 distinct values, but one value covers 52.2% of users, so it supports two groups, not quartiles. These are effects on all rows, read directly from the AIPW scores with no extra model:
+
+| f8 value range | Users | Conversion effect (AIPW) | vs average | Visit vs average |
+|---|---|---|---|---|
+| 3.635 – 3.911 | 3,539,789 (25%) | **0.003686** [0.003430, 0.003942] | **3.70×** | 3.42× |
+| 3.911 – 3.972 | 10,439,803 (75%) | 0.000085 [0.000064, 0.000106] | 0.09× | 0.18× |
+
+A quarter of users produce nearly all of the incremental conversions. Showing ads only to that group keeps most of the lift for about a quarter of the impressions.
+
+### 3. Estimators on a 2% sample (279,592 rows) vs the all-rows reference
+
+| Estimator | Estimand | Conversion (95% CI) | Visit (95% CI) | CI contains reference |
+|---|---|---|---|---|
+| Difference in means | ATE | 0.001303 [0.000818, 0.001788] | 0.008490 [0.006425, 0.010556] | ✅ ✅ |
+| AIPW (cross-fitted) | ATE | 0.001008 [0.000550, 0.001467] | 0.006101 [0.004364, 0.007838] | ✅ ✅ |
+| Propensity score matching | ATT | 0.001020 [0.000431, 0.001608] | 0.006734 [0.004195, 0.009273] | ✅ ✅ |
+
+PSM matched 237,311 of 237,543 treated users (99.9%). No control was reused more than 50 times.
+
+### 4. Confounded-sample test: can the estimators undo a known bias?
+
+I bias the sample on purpose. Untreated users are dropped depending on the feature that best predicts the outcome, so the control share falls from 15.0% to 9.6%. Treated users are untouched, so the right answer is still the reference effect.
+
+| Outcome | Biased through | Naive difference | AIPW (ATT) | PSM (ATT) | Target |
+|---|---|---|---|---|---|
+| Visit | f9 | **−0.010405** ❌ (sign flipped) | 0.005739 ✅ | 0.007125 ✅ | 0.007459 |
+| Conversion | f11 | 0.001873 ❌ (≈ 2× too high) | −0.000070 ✅ (CI ±0.0012) | 0.000847 ✅ | 0.000997 |
+
+✅ means the 95% CI contains the target. The naive comparison fails both times. For conversion, AIPW's interval contains the target only because it is very wide: with 0.3% positives and 9.6% controls, there is little signal left. PSM is the more precise estimator in that case.
+
+### 5. Targeting models judged on held-out users
+
+T-, X-Learner and Causal Forest (EconML) are trained on 139,796 users and scored on a separate 139,796. The scores use **observed** outcomes of the held-out users, not the models' own predictions:
+
+| Model | Conversion Qini | Conversion top-25% lift | Visit Qini | Visit top-25% lift |
+|---|---|---|---|---|
+| T-Learner | 0.137 | 2.47× | 0.045 | 1.92× |
+| X-Learner | 0.104 | 2.47× | 0.144 | 2.31× |
+| **Causal Forest (DML)** | **0.192** | **2.89×** | **0.339** | **3.23×** |
+
+"Top-25% lift" is the observed uplift among the 25% of held-out users the model ranks highest, divided by the overall uplift. Causal Forest is best on both outcomes. One caveat: these held-out uplifts use a within-segment treated-minus-control comparison, which carries the small imbalance from section 1.
+
+### 6. Refutation
+
+On conversion, all three checks pass:
+- **Placebo treatment:** treatment labels shuffled 50 times; the effect disappears.
+- **Random common cause:** adding a random feature leaves AIPW unchanged.
+- **Subset stability:** the effect is stable across 10 random subsets.
 
 ---
 
-## How It Works
+## Bugs found and fixed during this audit
 
-Criteo (14M rows) + Olist (100K orders) ↓ Feature Engineering (dbt SQL) ↓ DoWhy Causal Graph → Identification Strategy ↓ ┌─────────────────────────────────────┐ │ Estimator Selection │ │ ├── PSM (observational data) │ │ ├── DiD (time-based rollouts) │ │ └── CausalForest DML (CATE) │ └─────────────────────────────────────┘ ↓ SHAP → Treatment Effect Heterogeneity ↓ MLflow → ATE, CATE, CI, refutation p-values ↓ Drift Monitor (PSI + MMD) → Retraining trigger ↓ Streamlit Growth Team Dashboard
+Each fix has a regression test.
 
----
-
-## Supported Estimators
-
-| Estimator        | Method                     | Best For                            | Implementation                                      |
-| ---------------- | -------------------------- | ----------------------------------- | --------------------------------------------------- |
-| **PSM**          | Propensity Score Matching  | Observational data, cross-sectional | `liftlab.causal.estimators.PropensityScoreMatching` |
-| **DiD**          | Difference-in-Differences  | Time-based rollouts, pre/post data  | `liftlab.causal.estimators.DifferenceInDifferences` |
-| **T-Learner**    | Meta-learner baseline      | Balanced treatment groups           | `liftlab.causal.uplift.TLearnerUplift`              |
-| **X-Learner**    | Cross-fitting meta-learner | Imbalanced treatment (85/15 split)  | `liftlab.causal.uplift.XLearnerUplift`              |
-| **CausalForest** | Double ML + forest         | Heterogeneous effects, main model   | `liftlab.causal.uplift.CausalForestUplift`          |
-
----
-
-## Sample Results
-
-All estimators run on the [Criteo Uplift Dataset](https://ailab.criteo.com/ressources/criteo-uplift-prediction-dataset/) (14M rows, treatment/control labels):
-
-### Estimator Convergence
-
-| Estimator    | ATE          | 95% CI Lower | 95% CI Upper | Duration |
-| ------------ | ------------ | ------------ | ------------ | -------- |
-| PSM          | **0.001189** | 0.000640     | 0.001772     | 18s      |
-| DiD          | **0.001131** | 0.000424     | 0.001839     | 2s       |
-| T-Learner    | **0.001243** | 0.001119     | 0.001362     | 19s      |
-| X-Learner    | **0.001242** | 0.001144     | 0.001346     | 28s      |
-| CausalForest | **0.000962** | -0.006259    | 0.008182     | 52s      |
-
-> ✅ All five independent estimators converge on **ATE ≈ +0.001** — a strong robustness signal across fundamentally different identification strategies.
-
-### Heterogeneous Treatment Effects (SHAP)
-
-**Top 3 features driving treatment effect heterogeneity:**
-
-| Feature | SHAP Importance | Interpretation                                   |
-| ------- | --------------- | ------------------------------------------------ |
-| `f8`    | 0.001788        | Strongest predictor of who responds to treatment |
-| `f3`    | 0.001249        | Second-order heterogeneity driver                |
-| `f2`    | 0.000886        | Third-order effect modifier                      |
-
-### Customer Segmentation Results
-
-| Segment                      | % of Users | CATE         | Lift vs Average |
-| ---------------------------- | ---------- | ------------ | --------------- |
-| **Low `f8`** (high-response) | 25%        | **0.003395** | **3.53x** 🎯    |
-| **High `f8`** (low-response) | 75%        | 0.000129     | 0.13x           |
-
-> 💡 **Business Impact:** Targeting only the high-response segment delivers 3.5x the average lift at 25% of the cost. This is the ROI of CATE over ATE.
+| Problem | Effect | Fix |
+|---|---|---|
+| Treated Criteo as clean randomization | Headline effect overstated (visit by 39%) | Randomization check (C2ST + SMD vs its noise level); AIPW reference |
+| Criteo file is stored ordered by treatment, and 52% of users share one f8 value | Rank-based quartiles split tied users by file position, giving fake segments (3.61×, 0.14×, NaN, 0.02×) | Value-based bins for features; random tie-breaking for model scores |
+| Tied propensity scores in PSM | One control reused 147,395 times (reproduction); CI ±0.09 on a 0.001 effect | Random tie-breaking smaller than any score gap |
+| Logistic propensity on skewed features | Left ~50% of injected bias; CIs covered the truth 27% of the time | Gradient-boosted propensity with early stopping |
+| Bootstrap CI for matching with replacement | Invalid (Abadie & Imbens 2008); an estimate fell outside its own CI | Abadie–Imbens style variance with a control-reuse term; 97.5% coverage in 40 simulations |
+| Difference-in-differences on Criteo with a fabricated time column | A meaningless number | DiD kept for real panel data, validated on simulation only |
+| T/X-Learner CIs from bootstraps that never refit | Overconfident intervals | Models judged on held-out data instead |
+| Segment lift measured in-sample | Optimistic numbers | 50/50 stratified train/test split |
+| MLflow check only tested if a port was open | On macOS, AirPlay answers on port 5000; each call hung ~4 min | Probe requires HTTP 200 from `/health` |
 
 ---
 
-## Tech Stack
+## How it works
 
-| Layer                 | Tool              | Role                                          |
-| --------------------- | ----------------- | --------------------------------------------- |
-| **Causal Inference**  | EconML            | T-learner, X-learner, CausalForestDML         |
-|                       | DoWhy             | Causal graph specification + identification   |
-|                       | SHAP              | Treatment effect heterogeneity interpretation |
-| **API & Data**        | FastAPI           | Experimentation platform REST API             |
-|                       | PostgreSQL        | Experiment configs and results store          |
-|                       | SQLAlchemy        | ORM + Alembic migrations                      |
-| **ML Infrastructure** | MLflow            | Experiment tracking + model versioning        |
-|                       | dbt               | SQL feature engineering pipelines             |
-| **Monitoring**        | Evidently         | Drift detection (PSI, MMD)                    |
-| **Dashboards**        | Streamlit         | Growth team experimentation UI                |
-| **DevOps**            | Docker            | Containerized services                        |
-|                       | GitHub Actions    | CI/CD + drift-triggered retraining            |
-| **Base ML**           | Scikit-learn      | Base learners for meta-learners               |
-|                       | SciPy/Statsmodels | DiD, power analysis, parallel trends test     |
+```
+Criteo CSV (3 GB) ──► Parquet cache (float32 / int8), validated columns
+        │
+        ├─ 0. Randomization check ── classifier two-sample test, |SMD| vs noise
+        ├─ 1. Reference effect ───── cross-fitted AIPW on all 14M rows
+        ├─ 2. Segments ───────────── subgroup means of the AIPW scores
+        ├─ 3. Sample estimators ──── difference in means, AIPW, PSM
+        ├─ 4. Confounded test ────── injected bias, ATT estimators vs reference
+        ├─ 5. CATE models ────────── T / X / Causal Forest, held-out Qini
+        └─ 6. Refutation ─────────── placebo, random common cause, subsets
+                     │
+                     ▼
+     results/criteo_benchmark.json ──► Streamlit dashboard (Results page)
+
+FastAPI ── POST /experiments, POST /estimate ──► PostgreSQL (runs) + MLflow (optional)
+```
+
+### Estimators
+
+| Estimator | Estimand | Notes |
+|---|---|---|
+| Difference in means | ATE | Neyman standard error |
+| AIPW | ATE or ATT | Cross-fitted; gradient-boosted outcome and propensity models; influence-function SE; reports the share of clipped propensities |
+| Propensity score matching | ATT | 1:1 nearest neighbour with replacement on the logit propensity; 0.2 SD caliper; random tie-breaking; balance (SMD) before and after |
+| Difference-in-differences | ATT | 2×2 with HC3 errors, for panel data; validated on simulated panels |
+| T-Learner, X-Learner, Causal Forest (DML) | CATE | EconML; judged on held-out data with Qini and top-k uplift |
+
+Each estimator is tested against `liftlab.causal.simulate`, which generates randomized trials, confounded samples and panels with **known** effects.
 
 ---
 
 ## Quickstart
 
-### Prerequisites
-
-- Python 3.11+
-- Docker + Docker Compose
-- 4GB RAM minimum (EconML is memory-intensive)
-
-### 1. Clone and install
-
-git clone https://github.com/YOUR_USERNAME/liftlab.git
+```bash
+git clone https://github.com/MohammedAhmeduddin/liftlab.git
 cd liftlab
-python3.11 -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+```
 
-## 2. Configure environment
+Download the Criteo Uplift v2.1 CSV from the [Criteo AI Lab page](https://ailab.criteo.com/criteo-uplift-prediction-dataset/) and save it as `data/criteo_uplift.csv`. The first load writes a Parquet cache next to it, so later loads take seconds.
 
-cp .env.example .env
-
-### Edit .env with your settings (optional — defaults work out of the box)
-
-## 3. Start infrastructure
-
-docker compose up -d
-
-### Starts PostgreSQL (port 5432) and MLflow (port 5001)
-
-### 4. Download datasets
-
-Criteo Uplift Dataset (required)
-
-Download from ailab.criteo.com
-Place criteo-uplift-v2.1.csv.gz in data/
-Decompress: gunzip data/criteo-uplift-v2.1.csv.gz && mv data/criteo-uplift-v2.1.csv data/criteo_uplift.csv
-Olist E-Commerce Dataset (optional — for dbt feature engineering demo)
-
-Download from Kaggle
-Unzip to data/olist/
-
-### 5. Start the API
-
-uvicorn liftlab.api.main:app --reload --host 0.0.0.0 --port 8080
-API docs available at http://localhost:8080/docs
-
-### 6. Launch the dashboard
-
+```bash
+python scripts/check_randomization.py     # balance, C2ST, DM vs AIPW on 5 samples
+python scripts/benchmark_criteo.py        # full benchmark → results/criteo_benchmark.json
 streamlit run src/liftlab/dashboard/app.py
-Dashboard opens at http://localhost:8501
+```
 
-### 7. Run your first experiment
+### API (optional)
 
-python notebooks/eda/03_api_test.py
+```bash
+cp .env.example .env
+docker compose up -d                      # PostgreSQL :5432, MLflow :5001
+uvicorn liftlab.api.main:app --port 8080
+```
 
-### Expected output:
+```bash
+curl -X POST http://localhost:8080/experiments/ -H "Content-Type: application/json" \
+  -d '{"name": "criteo_cf", "feature_cols": ["f0","f1","f2","f3","f4","f5","f6","f7","f8","f9","f10","f11"],
+       "estimator": "causalforest", "sample_frac": 0.02}'
 
-[1] Health check... ✅
-[2] Creating experiment... ✅ Experiment ID: dc041bbb-...
-[4] Running causal estimation (~2 min)... ✅
-ATE : 0.000962
-95% CI : [-0.006259, 0.008182]
-Duration : 51.6s
-── Top 3 SHAP Features ─────────────────
-f8 : 0.000906
-...
+curl -X POST http://localhost:8080/estimate/ -H "Content-Type: application/json" \
+  -d '{"experiment_id": "<id returned by the first call>"}'
+```
 
-## Architecture
+Estimators available through the API: `difference_in_means`, `aipw`, `psm`, `tlearner`, `xlearner`, `causalforest`. CATE runs return the AIPW average effect, the held-out Qini, and observed uplift per predicted-effect quartile. MLflow is optional: if it is unreachable, runs are still stored in PostgreSQL.
 
-### System Flow
+### Tests
 
-![alt text](image.png)
+```bash
+pytest -q                                 # 99 tests, ~40 s, needs PostgreSQL for API/DB tests
+pytest -q --deselect tests/test_api.py --deselect tests/test_session.py \
+       -k "not endpoint and not unknown_experiment"    # without a database
+```
 
-## Project Structure
+CI runs the full suite against a PostgreSQL service, enforces 85% coverage (currently 94%), and lints with ruff.
 
-![alt text](image-1.png)
+---
 
-### MLOps: Drift Detection Pipeline
+## Project structure
 
-Population drift invalidates past causal estimates — a promotion targeting segment A produces incorrect lift estimates when applied to segment B.
+```
+src/liftlab/
+  causal/
+    estimators.py    difference in means, AIPW (ATE/ATT), PSM, DiD
+    diagnostics.py   randomization check: classifier two-sample test, balance
+    uplift.py        T / X / Causal Forest with held-out evaluation
+    evaluation.py    Qini, uplift at k, tie-safe ranking and value bins
+    refutation.py    placebo, random common cause, subset stability
+    graph.py         DoWhy causal graph (randomized vs observational)
+    simulate.py      data with known effects for testing
+  data/loaders.py    Criteo loader, validation, Parquet cache
+  api/               FastAPI app: experiments and estimation runs
+  db/                SQLAlchemy models and session (psycopg 3)
+  monitoring/        population drift (PSI, MMD) and alerts
+  dashboard/app.py   Streamlit: run estimators, benchmark results, drift demo
+  mlflow_logger.py   optional run logging with a fast health probe
+scripts/
+  benchmark_criteo.py      the full benchmark
+  check_randomization.py   standalone randomization diagnostics
+```
 
-LiftLab monitors two metrics weekly:
-
-Population Stability Index (PSI)
-PSI = Σ (current% - reference%) \* ln(current% / reference%)
-
-Thresholds (industry standard):
-
-PSI < 0.10 → ✅ Stable, no action
-PSI < 0.20 → 🟡 Moderate shift, monitor
-PSI ≥ 0.20 → 🔴 Significant shift, trigger retraining
-Maximum Mean Discrepancy (MMD)
-
-Multivariate covariate shift detection using RBF kernel:
-MMD² = E[k(x,x')] - 2E[k(x,y)] + E[k(y,y')]
-
-Threshold: MMD ≥ 0.05 → population shift detected
-
-Automated Retraining
-
-When thresholds are exceeded:
-
-GitHub Actions workflow_dispatch triggers retrain.yml
-CausalForest re-trains on current population sample
-New ATE + CATE estimates logged to MLflow
-Slack alert sent to growth team with updated estimates
-
-### API Usage
-
-### Create an experiment
-
-curl -X POST http://localhost:8080/experiments/ \
- -H "Content-Type: application/json" \
- -d '{
-"name": "q4_promo_test",
-"description": "Q4 20% discount causal analysis",
-"treatment_col": "treatment",
-"outcome_col": "conversion",
-"feature_cols": ["f0", "f1", "f2", "f3", "f4", "f5"],
-"estimator": "causalforest",
-"sample_frac": 0.05
-}'
-
-### Run estimation
-
-curl -X POST http://localhost:8080/estimate/ \
- -H "Content-Type: application/json" \
- -d '{
-"experiment_id": "dc041bbb-f512-4e1d-9c4f-85e30bdf3173"
-}'
-
-### Response:
-
-{
-"run_id": "a3f2...",
-"ate": 0.000962,
-"ci_lower": -0.006259,
-"ci_upper": 0.008182,
-"n_treated": 237543,
-"n_control": 42049,
-"shap_importance": {
-"f8": 0.000906,
-"f2": 0.000569,
-...
-},
-"segment_effects": [
-{"bin": 0, "mean_cate": 0.003395, "lift_vs_average": 3.53},
-{"bin": 1, "mean_cate": 0.000129, "lift_vs_average": 0.13}
-],
-"duration_seconds": 51.6
-}
-
-### Testing
-
-# Run full test suite
-
-pytest tests/ -v
-
-### With coverage report
-
-pytest tests/ --cov=liftlab --cov-report=html
-
-### Run specific test file
-
-pytest tests/test_estimators.py -v
-
-Test Coverage: 59 tests, 87% coverage
-
-Key test categories:
-
-Causal estimators (PSM, DiD, T/X-Learner, CausalForest)
-Drift detection (PSI, MMD)
-API endpoints (CRUD + estimation)
-Data loaders and schemas
-Edge cases and error handling
+---
 
 ## Limitations
 
-When causal inference assumptions break:
-
-1. Unconfoundedness
-
-PSM and CausalForest assume no unobserved confounders. If Criteo's targeting uses features not in f0-f11, estimates are biased.
-
-Solution: Collect more features or use IV/front-door adjustment if instruments available.
-
-2. Parallel Trends (DiD)
-
-Requires treatment and control groups to trend identically pre-treatment. Violated when groups are inherently different.
-
-Solution: Run parallel trends test (included) or use synthetic control methods.
-
-3. SUTVA
-
-Assumes no interference between units. Violated in social/network settings where one user's treatment affects another.
-
-Solution: Use cluster-randomized designs or spillover-aware estimators.
-
-4. Overlap
-
-PSM requires common support — if propensity scores don't overlap, matching fails. Our 85/15 treatment split creates narrow overlap.
-
-Solution: Trim extremes or use IPW (inverse propensity weighting) instead.
-
-## Contributing
-
-This is a portfolio project, but contributions are welcome:
-Fork the repository
-Create a feature branch (git checkout -b feature/amazing-feature)
-Commit your changes (git commit -m 'Add amazing feature')
-Push to the branch (git push origin feature/amazing-feature)
-Open a Pull Request
-
-### License
-
-MIT License - see LICENSE file for details
-
-### Acknowledgments
-
-Criteo AI Lab for the Criteo Uplift Prediction Dataset
-Microsoft Research for EconML library
-PyWhy team for DoWhy causal inference framework
-Olist for the Brazilian E-Commerce Public Dataset
-
-Contact
-
-Ahmeduddin Mohammed
-
-📧 mohammed.ahmeduddin16@gmail.com
-🔗 https://www.linkedin.com/in/mohammed-ahmeduddin/
-💻 https://github.com/MohammedAhmeduddin
+- **AIPW is the reference, not ground truth.** It removes bias from the measured features. If treatment also depends on something not in the data, some bias remains.
+- **Criteo features are anonymized**, so the f8 segment can be found but not explained.
+- **Models are fit on a 2% sample** (279,592 rows) to keep the benchmark under 3 minutes. The reference effects and f8 segments use all 13,979,592 rows.
+- **The drift monitor demo uses simulated populations**, because Criteo has no time dimension.
+- **Difference-in-differences is validated only on simulated panels**, for the same reason.

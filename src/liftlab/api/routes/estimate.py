@@ -50,7 +50,9 @@ def _run_estimator(experiment: Experiment, df) -> dict:
         if name == "difference_in_means":
             r = difference_in_means(df, t_col, y_col)
         elif name == "aipw":
-            r = aipw(df, features, t_col, y_col, propensity=float(df[t_col].mean()))
+            # Estimated propensity: on Criteo treatment is slightly predictable
+            # from the features (see scripts/check_randomization.py).
+            r = aipw(df, features, t_col, y_col)
         else:
             r = PropensityScoreMatching().estimate(df, features, t_col, y_col)
         return {"estimand": r.estimand, "ate": r.ate, "ci_lower": r.ci_lower,
@@ -64,11 +66,12 @@ def _run_estimator(experiment: Experiment, df) -> dict:
     res, test = model.fit_evaluate(df, features, t_col, y_col)
     quartile = score_groups(res.test_cate, 4)  # 0 = highest predicted; random tie-breaking
     segments = observed_uplift_by_group(test[y_col].to_numpy(float), test[t_col].to_numpy(int), quartile)
-    dm = difference_in_means(df, t_col, y_col)
+    # Average effect from AIPW (covariate-adjusted), consistent with the benchmark
+    avg = aipw(df, features, t_col, y_col)
     return {
-        "estimand": "ATE", "ate": dm.ate, "ci_lower": dm.ci_lower, "ci_upper": dm.ci_upper,
-        "std_error": dm.std_error, "p_value": dm.p_value,
-        "n_treated": dm.n_treated, "n_control": dm.n_control,
+        "estimand": "ATE", "ate": avg.ate, "ci_lower": avg.ci_lower, "ci_upper": avg.ci_upper,
+        "std_error": avg.std_error, "p_value": avg.p_value,
+        "n_treated": avg.n_treated, "n_control": avg.n_control,
         "mean_cate": res.mean_cate,
         "qini_coefficient": res.evaluation["qini_coefficient"],
         "top_25pct_lift": res.evaluation["top_25pct"]["lift_vs_overall"],
