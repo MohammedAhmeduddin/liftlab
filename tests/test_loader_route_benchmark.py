@@ -165,11 +165,18 @@ def test_benchmark_script_end_to_end(tmp_path):
     simulate_rct(20_000, base_rate=0.1, base_effect=0.02, seed=9).drop(columns="_true_cate").to_csv(data, index=False)
     out = tmp_path / "bench.json"
     assert bench.main(["--data", str(data), "--out", str(out), "--model-frac", "0.5",
-                       "--cf-trees", "8", "--psm-bootstrap", "3"]) == 0
+                       "--cf-trees", "8"]) == 0
     sections = json.loads(out.read_text())["sections"]
-    assert set(sections) == {"data", "rct_ground_truth", "f8_groups_observed", "sample_estimators",
-                             "confounded_test", "cate_models_holdout", "refutation"}
+    assert set(sections) == {"data", "randomization_check", "full_data_effects", "f8_groups",
+                             "sample_estimators", "confounded_test", "cate_models_holdout",
+                             "refutation"}
     assert sections["data"]["rows"] == 20_000
-    truth = sections["rct_ground_truth"]["conversion"]
-    assert truth["ci"][0] < truth["estimate"] < truth["ci"][1]
+    # simulated data is truly randomized: the check must not cry wolf
+    assert sections["randomization_check"]["c2st"]["detected"] is False
+    ref = sections["full_data_effects"]["conversion"]
+    assert ref["reference"] == "aipw"
+    assert ref["aipw"]["ci"][0] < ref["aipw"]["estimate"] < ref["aipw"]["ci"][1]
+    # f8 groups carry both the raw and the AIPW effect
+    assert {"uplift", "aipw", "aipw_lift_vs_overall"} <= set(sections["f8_groups"]["conversion"][0])
+    assert sections["confounded_test"]["aipw_att"]["estimand"] == "ATT"
     assert set(sections["cate_models_holdout"]["visit"]) >= {"tlearner", "xlearner", "causalforest"}

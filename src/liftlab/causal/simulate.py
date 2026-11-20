@@ -19,6 +19,7 @@ against a ground truth first, then run on Criteo.
 from __future__ import annotations
 
 import numpy as np
+from scipy import stats
 import pandas as pd
 
 FEATURES = [f"f{i}" for i in range(12)]
@@ -62,18 +63,25 @@ def simulate_rct(
 
 
 def make_confounded(
-    df: pd.DataFrame, feature: str = "f0", strength: float = 1.5, seed: int = 0
+    df: pd.DataFrame, feature: str = "f0", strength: float = 1.5,
+    min_keep: float = 0.2, seed: int = 0,
 ) -> pd.DataFrame:
     """Biased subsample: control units are kept with probability that rises
     with ``feature``, so treated and control differ in that feature.
 
-    ``feature`` should also drive the outcome (f0 does in simulate_rct and
-    is a strong predictor in Criteo), otherwise the bias is invisible.
+    The feature enters through its normal-score rank, so skewed or heavily
+    tied features (common in Criteo) cannot produce extreme z-scores, and
+    every control is kept with probability at least ``min_keep``. Together
+    these guarantee overlap, so a correct adjustment can recover the effect.
+
+    ``feature`` should also drive the outcome (f0 does in simulate_rct),
+    otherwise the bias is invisible.
     """
     rng = np.random.default_rng(seed)
     is_control = df["treatment"].to_numpy() == 0
-    z = (df[feature] - df[feature].mean()) / df[feature].std()
-    keep_p = _sigmoid(strength * z.to_numpy())
+    u = df[feature].rank(pct=True, method="average").to_numpy()
+    z = stats.norm.ppf(np.clip(u - 0.5 / len(df), 1e-6, 1 - 1e-6))
+    keep_p = min_keep + (1 - min_keep) * _sigmoid(strength * z)
     keep = ~is_control | (rng.random(len(df)) < keep_p)
     return df[keep].reset_index(drop=True)
 

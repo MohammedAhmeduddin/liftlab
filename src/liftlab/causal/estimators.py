@@ -1,15 +1,16 @@
 """
 Average-effect estimators.
 
-- difference_in_means: the unbiased estimator in a randomized trial; on
-  Criteo (an RCT) this is the ground truth the others are checked against.
-- AIPW: doubly robust, cross-fitted, covariate-adjusted ATE with an
-  influence-function standard error. Consistent if either the outcome or
-  the propensity model is right; in an RCT it mainly adds precision.
+- difference_in_means: unbiased when treatment is truly randomized. On
+  Criteo a small treated/control imbalance makes it drift, so it is
+  reported but not used as the reference.
+- AIPW: doubly robust, cross-fitted, covariate-adjusted ATE (or ATT) with
+  an influence-function standard error. Consistent if either the outcome
+  or the propensity model is right; the Criteo reference.
 - PropensityScoreMatching: effect on the treated (ATT) for observational
   data, 1:1 nearest-neighbour matching with replacement on the logit
-  propensity, Austin's caliper (0.2 SD), balance diagnostics, and a
-  bootstrap that repeats the whole procedure.
+  propensity, Austin's caliper (0.2 SD), balance diagnostics, and an
+  Abadie-Imbens style standard error that accounts for reused controls.
 - DifferenceInDifferences: 2x2 DiD for panel data with a pre and a post
   period. Needs real time variation; it is not applicable to Criteo.
 
@@ -127,6 +128,36 @@ def cross_fit_nuisances(
     return mu0, mu1, np.clip(e, 0.01, 0.99)
 
 
+def aipw_scores(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    treatment_col: str = "treatment",
+    outcome_col: str = "conversion",
+    propensity: Optional[float] = None,
+    n_folds: int = 2,
+    seed: int = 42,
+    estimand: str = "ATE",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-unit doubly robust scores and the propensities used.
+
+    ATE: the mean of the scores is the ATE, and the mean within a subgroup
+    is that subgroup's effect. ATT: the mean is the effect on the treated
+    (only E[Y|X,T=0] and the propensity are needed).
+    """
+    if estimand not in ("ATE", "ATT"):
+        raise ValueError("estimand must be 'ATE' or 'ATT'")
+    _check_binary(df[treatment_col], treatment_col)
+    X = StandardScaler().fit_transform(df[feature_cols].to_numpy(dtype=float))
+    t = df[treatment_col].to_numpy(dtype=int)
+    y = df[outcome_col].to_numpy(dtype=float)
+    mu0, mu1, e = cross_fit_nuisances(X, t, y, n_folds, propensity, seed=seed)
+    if estimand == "ATT":
+        psi = (t * (y - mu0) - (1 - t) * e / (1 - e) * (y - mu0)) / t.mean()
+    else:
+        psi = mu1 - mu0 + t * (y - mu1) / e - (1 - t) * (y - mu0) / (1 - e)
+    return psi, e
+
+
 def aipw(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -135,22 +166,26 @@ def aipw(
     propensity: Optional[float] = None,
     n_folds: int = 2,
     seed: int = 42,
+    estimand: str = "ATE",
 ) -> CausalEstimate:
-    """Augmented inverse-propensity weighted ATE with cross-fitting."""
-    _check_binary(df[treatment_col], treatment_col)
-    X = StandardScaler().fit_transform(df[feature_cols].to_numpy(dtype=float))
+    """Augmented inverse-propensity weighted ATE (or ATT) with cross-fitting."""
+    psi, e = aipw_scores(df, feature_cols, treatment_col, outcome_col, propensity,
+                         n_folds, seed, estimand)
     t = df[treatment_col].to_numpy(dtype=int)
-    y = df[outcome_col].to_numpy(dtype=float)
-    mu0, mu1, e = cross_fit_nuisances(X, t, y, n_folds, propensity, seed=seed)
-    psi = mu1 - mu0 + t * (y - mu1) / e - (1 - t) * (y - mu0) / (1 - e)
     ate = float(psi.mean())
     se = float(psi.std(ddof=1) / np.sqrt(len(psi)))
     lo, hi, p = _normal_ci(ate, se)
     return CausalEstimate(
-        method="AIPW (doubly robust)", estimand="ATE",
+        method="AIPW (doubly robust)", estimand=estimand,
         ate=ate, ci_lower=float(lo), ci_upper=float(hi), std_error=se,
         n_treated=int(t.sum()), n_control=int((1 - t).sum()), p_value=float(p),
-        metadata={"n_folds": n_folds, "propensity": "known" if propensity is not None else "estimated"},
+        metadata={
+            "n_folds": n_folds,
+            "propensity": "known" if propensity is not None else "estimated",
+            # share of units whose propensity hit the 0.01 / 0.99 clip: a
+            # large value means poor overlap and a less trustworthy estimate
+            "clipped_share": float(np.mean((e <= 0.01) | (e >= 0.99))),
+        },
     )
 
 
@@ -176,9 +211,8 @@ class PropensityScoreMatching:
     within the caliper are dropped and reported in ``match_rate``.
     """
 
-    def __init__(self, caliper_sd: float = 0.2, n_bootstrap: int = 50, seed: int = 42):
+    def __init__(self, caliper_sd: float = 0.2, seed: int = 42):
         self.caliper_sd = caliper_sd
-        self.n_bootstrap = n_bootstrap
         self.seed = seed
 
     @staticmethod
@@ -213,16 +247,18 @@ class PropensityScoreMatching:
         y = df[outcome_col].to_numpy(dtype=float)
         att, mt, mc = self._att(X, t, y)
 
-        rng = np.random.default_rng(self.seed)
-        boots = []
-        for _ in range(self.n_bootstrap):
-            idx = rng.integers(0, len(y), len(y))  # resample units, redo everything
-            if len(set(t[idx])) < 2:
-                continue
-            boots.append(self._att(X[idx], t[idx], y[idx])[0])
-        se = float(np.std(boots, ddof=1)) if len(boots) > 1 else float("nan")
-        lo, hi = (np.percentile(boots, [2.5, 97.5]) if boots else (np.nan, np.nan))
-        p = 2 * (1 - stats.norm.cdf(abs(att / se))) if se and se > 0 else float("nan")
+        # Abadie-Imbens style variance. The naive bootstrap is not valid for
+        # nearest-neighbour matching with replacement (Abadie & Imbens 2008).
+        # Pair differences capture outcome noise and effect heterogeneity;
+        # the second term adds the covariance from a control being reused
+        # K times (homoskedastic control variance).
+        n1 = len(mt)
+        d = y[mt] - y[mc]
+        _, k = np.unique(mc, return_counts=True)
+        sigma0 = float(np.var(y[np.unique(mc)], ddof=1)) if len(k) > 1 else 0.0
+        var = (np.sum((d - att) ** 2) + np.sum(k * (k - 1)) * sigma0) / n1**2
+        se = float(np.sqrt(var))
+        lo, hi, p = _normal_ci(att, se)
 
         frame = df[feature_cols]
         smd_before = standardized_mean_differences(frame[t == 1], frame[t == 0], feature_cols)
@@ -238,7 +274,7 @@ class PropensityScoreMatching:
                 "unique_controls_used": int(len(np.unique(mc))),
                 "max_smd_before": max(smd_before.values()),
                 "max_smd_after": max(smd_after.values()),
-                "n_bootstrap": len(boots),
+                "max_control_reuse": int(k.max()),
             },
         )
 

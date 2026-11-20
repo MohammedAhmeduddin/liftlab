@@ -26,12 +26,11 @@ import time
 from pathlib import Path
 
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from liftlab.causal.estimators import aipw, difference_in_means, standardized_mean_differences  # noqa: E402
+from liftlab.causal.diagnostics import balance, classifier_two_sample_test  # noqa: E402
+from liftlab.causal.estimators import aipw, difference_in_means  # noqa: E402
 from liftlab.causal.evaluation import value_bins  # noqa: E402
 from liftlab.data.loaders import FEATURES, load_criteo  # noqa: E402
 
@@ -50,13 +49,12 @@ def main() -> None:
 
     df = load_criteo(sample_frac=1.0, path=args.data)
     p_treat = float(df["treatment"].mean())
-    t = df["treatment"].to_numpy()
 
-    print("\n── 1. Balance (|SMD|, < 0.1 is the usual bar) ──────────────")
-    smd = standardized_mean_differences(df[t == 1], df[t == 0], FEATURES)
-    for f, v in sorted(smd.items(), key=lambda kv: -kv[1]):
-        print(f"  {f:4s} {v:.4f}")
-    out["smd"] = smd
+    print("\n── 1. Balance (|SMD| per feature) ───────────────────────────")
+    bal = balance(df, FEATURES)
+    for f, v in sorted(bal["smd"].items(), key=lambda kv: -kv[1]):
+        print(f"  {f:4s} {v:.4f}  ({v / bal['smd_noise_sd']:.0f}x the noise level)")
+    out["balance"] = bal
 
     print("\n── 2. Treated share by feature value group (overall "
           f"{p_treat:.3f}) ──")
@@ -70,16 +68,10 @@ def main() -> None:
     out["treated_share_by_group"] = shares
 
     print("\n── 3. Classifier two-sample test ────────────────────────────")
-    s = df.sample(n=min(args.c2st_rows, len(df)), random_state=args.seed)
-    half = len(s) // 2
-    X, y = s[FEATURES].to_numpy(dtype=float), s["treatment"].to_numpy()
-    clf = HistGradientBoostingClassifier(max_iter=200, random_state=args.seed).fit(X[:half], y[:half])
-    auc = float(roc_auc_score(y[half:], clf.predict_proba(X[half:])[:, 1]))
-    rng = np.random.default_rng(args.seed)
-    null = [float(roc_auc_score(rng.permutation(y[half:]), clf.predict_proba(X[half:])[:, 1]))
-            for _ in range(20)]
-    print(f"  held-out AUC {auc:.4f}  (shuffled-label AUCs {min(null):.4f} – {max(null):.4f})")
-    out["c2st"] = {"rows": len(s), "auc": auc, "null_auc_min": min(null), "null_auc_max": max(null)}
+    c2 = classifier_two_sample_test(df, FEATURES, max_rows=args.c2st_rows, seed=args.seed)
+    print(f"  held-out AUC {c2['auc']:.4f}  (shuffled-label AUCs "
+          f"{c2['null_auc_min']:.4f} – {c2['null_auc_max']:.4f})")
+    out["c2st"] = c2
 
     print("\n── 4. Difference in means vs AIPW on independent samples ────")
     gaps = {}

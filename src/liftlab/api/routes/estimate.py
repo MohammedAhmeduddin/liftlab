@@ -52,7 +52,7 @@ def _run_estimator(experiment: Experiment, df) -> dict:
         elif name == "aipw":
             r = aipw(df, features, t_col, y_col, propensity=float(df[t_col].mean()))
         else:
-            r = PropensityScoreMatching(n_bootstrap=30).estimate(df, features, t_col, y_col)
+            r = PropensityScoreMatching().estimate(df, features, t_col, y_col)
         return {"estimand": r.estimand, "ate": r.ate, "ci_lower": r.ci_lower,
                 "ci_upper": r.ci_upper, "std_error": r.std_error, "p_value": r.p_value,
                 "n_treated": r.n_treated, "n_control": r.n_control}

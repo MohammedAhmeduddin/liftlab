@@ -8,6 +8,7 @@ from liftlab.causal.estimators import (
     DifferenceInDifferences,
     PropensityScoreMatching,
     aipw,
+    aipw_scores,
     difference_in_means,
     standardized_mean_differences,
 )
@@ -66,10 +67,49 @@ class TestAIPW:
         assert abs(adjusted - truth) < abs(naive - truth)
 
 
+    def test_att_recovers_effect_on_treated_under_confounding(self, rct, truth):
+        """make_confounded leaves treated units untouched, so the ATT on the
+        biased sample equals the RCT effect."""
+        conf = make_confounded(rct, strength=2.0, seed=3)
+        est = aipw(conf, FEATURES, estimand="ATT")
+        assert est.estimand == "ATT"
+        assert covers(est, truth)
+        assert est.metadata["clipped_share"] < 0.01
+
+    def test_group_means_of_scores_are_group_effects(self, rct):
+        psi, e = aipw_scores(rct, FEATURES, propensity=0.85)
+        assert np.allclose(e, 0.85)
+        low = (rct["f8"] <= rct["f8"].quantile(0.25)).to_numpy()
+        # responders (low f8) have a much larger effect in simulate_rct
+        assert psi[low].mean() > 2 * psi[~low].mean()
+        assert psi.mean() == pytest.approx(aipw(rct, FEATURES, propensity=0.85).ate)
+
+    def test_rejects_unknown_estimand(self, rct):
+        with pytest.raises(ValueError):
+            aipw(rct, FEATURES, estimand="ATC")
+
+
+class TestMakeConfounded:
+    def test_overlap_holds_for_skewed_tied_feature(self):
+        rng = np.random.default_rng(0)
+        n = 40_000
+        df = pd.DataFrame({
+            # half the users share one value, the rest have a long tail
+            "f0": np.where(rng.random(n) < 0.5, 3.97, 3.97 - rng.exponential(0.05, n) * 20),
+            "treatment": (rng.random(n) < 0.85).astype(int),
+        })
+        conf = make_confounded(df, feature="f0", strength=3.0, min_keep=0.2, seed=1)
+        lowest = conf[conf["f0"] <= df["f0"].quantile(0.01)]
+        # even the most extreme bin keeps controls (>= min_keep of them)
+        share_ctrl = 1 - lowest["treatment"].mean()
+        assert share_ctrl > 0.15 * 0.2 * 0.5
+        assert (conf["treatment"] == 1).sum() == (df["treatment"] == 1).sum()
+
+
 class TestPSM:
     def test_balances_and_recovers_att_on_confounded_data(self, rct, truth):
         conf = make_confounded(rct, strength=2.0, seed=3)
-        est = PropensityScoreMatching(n_bootstrap=15).estimate(conf, FEATURES)
+        est = PropensityScoreMatching().estimate(conf, FEATURES)
         assert est.estimand == "ATT"
         assert est.metadata["max_smd_before"] > 0.3
         assert est.metadata["max_smd_after"] < 0.1
@@ -79,7 +119,7 @@ class TestPSM:
     def test_keeps_nearly_all_treated_units(self, rct):
         """Matching with replacement: unlike greedy 1:1 without replacement,
         treated units are not dropped just because controls are scarce."""
-        est = PropensityScoreMatching(n_bootstrap=2).estimate(rct, FEATURES)
+        est = PropensityScoreMatching().estimate(rct, FEATURES)
         assert est.metadata["match_rate"] > 0.95
 
     def test_smd(self):

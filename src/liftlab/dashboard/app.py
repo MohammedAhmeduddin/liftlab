@@ -214,19 +214,27 @@ elif page == "📈 Results":
                 "`results/criteo_benchmark.json`.")
     else:
         bench = json.loads(RESULTS_PATH.read_text())["sections"]
-        truth = bench["rct_ground_truth"]["conversion"]
-        st.metric("**RCT ground truth (all rows): conversion ATE**",
-                  f"{truth['estimate']:.6f}",
-                  delta=f"{truth['relative_lift']:+.1%} relative lift")
-        st.caption(f"Difference in means on {bench['data']['rows']:,} rows, "
-                   f"95% CI [{truth['ci'][0]:.6f}, {truth['ci'][1]:.6f}]")
+        eff = bench["full_data_effects"]["conversion"]
+        ref, raw = eff["aipw"], eff["difference_in_means"]
+        c2 = bench.get("randomization_check", {}).get("c2st", {})
+        col1, col2 = st.columns(2)
+        col1.metric("**Reference (AIPW, all rows): conversion ATE**", f"{ref['estimate']:.6f}",
+                    delta=f"{ref['relative_lift']:+.1%} relative lift")
+        col2.metric("**Raw difference in means**", f"{raw['estimate']:.6f}",
+                    delta=f"{raw['relative_lift']:+.1%} relative lift", delta_color="off")
+        st.caption(f"{bench['data']['rows']:,} rows. AIPW 95% CI [{ref['ci'][0]:.6f}, {ref['ci'][1]:.6f}]. "
+                   + (f"Randomization check: a classifier predicts treatment with AUC {c2['auc']:.3f} "
+                      f"(shuffled labels reach {c2['null_auc_max']:.3f}). "
+                      + ("Imbalance detected, so the raw difference is not used as ground truth."
+                         if c2["detected"] else "No imbalance detected.") if c2 else ""))
 
         rows = []
         for key, r in bench["sample_estimators"]["conversion"].items():
-            rows.append({"name": f"{r['method']} ({r['estimand']})", "est": r["estimate"],
-                         "lo": r["ci"][0], "hi": r["ci"][1]})
+            if isinstance(r, dict):
+                rows.append({"name": f"{r['method']} ({r['estimand']})", "est": r["estimate"],
+                             "lo": r["ci"][0], "hi": r["ci"][1]})
         conf = bench.get("confounded_test", {})
-        for key in ("naive_difference_in_means", "aipw_estimated_propensity", "psm"):
+        for key in ("naive_difference_in_means", "aipw_att", "psm"):
             if key in conf:
                 r = conf[key]
                 rows.append({"name": f"Confounded: {r['method']}", "est": r["estimate"],
@@ -236,8 +244,8 @@ elif page == "📈 Results":
             x=df["name"], y=df["est"], mode="markers", marker=dict(size=12),
             error_y=dict(type="data", symmetric=False, array=df["hi"] - df["est"],
                          arrayminus=df["est"] - df["lo"])))
-        fig.add_hline(y=truth["estimate"], line_dash="dash", annotation_text="RCT ground truth")
-        fig.update_layout(title="Estimators vs the randomized-trial ground truth (95% CI)",
+        fig.add_hline(y=ref["estimate"], line_dash="dash", annotation_text="AIPW reference (all rows)")
+        fig.update_layout(title="Estimators on a 2% sample vs the all-rows reference (95% CI)",
                           yaxis_title="Effect on conversion")
         st.plotly_chart(fig, width="stretch")
 
@@ -249,12 +257,13 @@ elif page == "📈 Results":
                  for m in models.values() if isinstance(m, dict)]
         st.dataframe(pd.DataFrame(table).round(3), width="stretch", hide_index=True)
 
-        f8_section = bench.get("f8_groups_observed")
+        f8_section = bench.get("f8_groups")
         if f8_section:
-            st.subheader("Observed uplift by f8 value group (all rows, no model)")
+            st.subheader("Effect by f8 value group (all rows): raw vs AIPW")
             f8 = pd.DataFrame(f8_section["conversion"])
-            st.dataframe(f8[["value_from", "value_to", "n", "uplift", "ci_lower", "ci_upper",
-                             "lift_vs_overall"]].round(6), width="stretch", hide_index=True)
+            st.dataframe(f8[["value_from", "value_to", "n", "uplift", "aipw", "aipw_ci_lower",
+                             "aipw_ci_upper", "aipw_lift_vs_overall"]].round(6),
+                         width="stretch", hide_index=True)
 
 elif page == "🔍 Drift Monitor":
     st.title("🔍 Population Drift Monitor")

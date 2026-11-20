@@ -1,14 +1,19 @@
 """
 Benchmark every LiftLab estimator on the real Criteo uplift data.
 
-Criteo is a randomized trial, so the difference in means on ALL rows is the
-ground truth. Everything else is checked against it:
+Criteo is documented as a randomized trial, but at 14M rows a classifier
+can predict treatment slightly better than chance, and the features that
+differ between arms also predict the outcome. So the raw difference in
+means is reported but NOT used as ground truth; the reference is
+cross-fitted AIPW on all rows, which adjusts for the features.
 
-  1. RCT ground truth on the full data (conversion and visit)
-  2. Observed uplift by f8 quartile on the full data (no model needed)
-  3. AIPW and PSM on a model sample
-  4. Confounded-sample test: bias a sample on purpose; can PSM / AIPW
-     recover the RCT answer where the naive comparison fails?
+  0. Randomization check: balance and a classifier two-sample test
+  1. Effects on all rows: raw difference in means and AIPW (reference)
+  2. Effect by f8 value group, raw and AIPW (no extra model)
+  3. Difference in means, AIPW and PSM on a model sample
+  4. Confounded-sample test: bias a sample on purpose; can AIPW / PSM
+     recover the reference where the naive comparison fails? (ATT, since
+     treated units are untouched)
   5. CATE models (T, X, Causal Forest) fit on a train split and judged on a
      held-out split (Qini, observed uplift in the top 10% / 25%)
   6. Refutation: placebo treatment, random common cause, subset stability
@@ -29,10 +34,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from liftlab.causal.estimators import PropensityScoreMatching, aipw, difference_in_means  # noqa: E402
+from liftlab.causal.diagnostics import balance, classifier_two_sample_test  # noqa: E402
+from liftlab.causal.estimators import (  # noqa: E402
+    Z95, PropensityScoreMatching, aipw, aipw_scores, difference_in_means,
+)
 from liftlab.causal.evaluation import observed_uplift_by_group, value_bins  # noqa: E402
 from liftlab.causal.refutation import (  # noqa: E402
     placebo_treatment, random_common_cause, subset_stability,
@@ -88,7 +97,6 @@ def main(argv=None) -> int:
                     help="sample used for AIPW/PSM/CATE models (default 2%% ≈ 280K rows)")
     ap.add_argument("--outcomes", nargs="+", default=["conversion", "visit"])
     ap.add_argument("--cf-trees", type=int, default=100)
-    ap.add_argument("--psm-bootstrap", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args(argv)
     rep = Report(Path(args.out), args)
@@ -100,14 +108,33 @@ def main(argv=None) -> int:
                      "conversion_rate": float(full.conversion.mean()),
                      "visit_rate": float(full.visit.mean())}, time.perf_counter() - t0)
 
-    t0 = section("1. RCT ground truth on all rows")
-    truth = {y: est_dict(difference_in_means(full, outcome_col=y)) for y in args.outcomes}
-    for y, r in truth.items():
-        print(f"  {y}: ATE {r['estimate']:.6f}  CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  "
-              f"relative lift {r['relative_lift']:+.1%}")
-    rep.add("rct_ground_truth", truth, time.perf_counter() - t0)
+    t0 = section("0. Randomization check")
+    bal = balance(full, FEATURES)
+    c2 = classifier_two_sample_test(full, FEATURES, seed=args.seed)
+    print(f"  max |SMD| {bal['max_smd']:.4f} ({bal['max_smd'] / bal['smd_noise_sd']:.0f}x the noise level)")
+    print(f"  classifier AUC {c2['auc']:.4f} (shuffled labels reach {c2['null_auc_max']:.4f})"
+          f" → imbalance {'DETECTED' if c2['detected'] else 'not detected'}")
+    rep.add("randomization_check", {"balance": bal, "c2st": c2}, time.perf_counter() - t0)
 
-    t0 = section("2. Observed uplift by f8 value group (all rows)")
+    t0 = section("1. Effects on all rows (reference = AIPW)")
+    effects, scores = {}, {}
+    for y in args.outcomes:
+        dm = est_dict(difference_in_means(full, outcome_col=y))
+        psi, _ = aipw_scores(full, FEATURES, outcome_col=y, seed=args.seed)
+        se = float(psi.std(ddof=1) / np.sqrt(len(psi)))
+        ate = float(psi.mean())
+        ref = {"method": "AIPW (doubly robust)", "estimand": "ATE", "estimate": ate,
+               "ci": [ate - Z95 * se, ate + Z95 * se], "std_error": se,
+               "relative_lift": ate / dm["control_rate"] if dm["control_rate"] else None}
+        effects[y] = {"difference_in_means": dm, "aipw": ref,
+                      "dm_minus_aipw": dm["estimate"] - ate, "reference": "aipw"}
+        scores[y] = psi
+        print(f"  {y:10s} raw difference {dm['estimate']:.6f} ({dm['relative_lift']:+.1%})   "
+              f"AIPW {ate:.6f} CI [{ref['ci'][0]:.6f}, {ref['ci'][1]:.6f}] ({ref['relative_lift']:+.1%})")
+    rep.add("full_data_effects", effects, time.perf_counter() - t0)
+    target = {y: effects[y]["aipw"]["estimate"] for y in args.outcomes}
+
+    t0 = section("2. Effect by f8 value group (all rows)")
     # Bins on VALUES: 52% of users share one f8 value, and the file is stored
     # ordered by treatment, so rank-based quartiles would split ties by file
     # position and put treated and control users in different groups.
@@ -117,31 +144,44 @@ def main(argv=None) -> int:
     for y in args.outcomes:
         rows = observed_uplift_by_group(full[y].to_numpy(float), full.treatment.to_numpy(int), f8_bins)
         rows["value_from"], rows["value_to"] = f8_edges[:-1][: len(rows)], f8_edges[1:][: len(rows)]
+        psi = scores[y]
+        aipw_rows = []
+        for g in rows["group"]:
+            m = f8_bins == g
+            est = float(psi[m].mean())
+            se = float(psi[m].std(ddof=1) / np.sqrt(m.sum()))
+            aipw_rows.append({"aipw": est, "aipw_ci_lower": est - Z95 * se, "aipw_ci_upper": est + Z95 * se,
+                              "aipw_lift_vs_overall": est / target[y] if target[y] else None})
+        rows = rows.join(pd.DataFrame(aipw_rows))
         seg[y] = rows.to_dict(orient="records")
-        print(f"  {y}: " + "  ".join(
-            f"[{r['value_from']:.3f}, {r['value_to']:.3f}] n={r['n']:,} {r['lift_vs_overall']:.2f}x"
-            for r in seg[y]))
+        for r in seg[y]:
+            print(f"  {y:10s} f8 in [{r['value_from']:.3f}, {r['value_to']:.3f}] n={r['n']:,}  "
+                  f"raw {r['lift_vs_overall']:.2f}x  AIPW {r['aipw']:.6f} "
+                  f"[{r['aipw_ci_lower']:.6f}, {r['aipw_ci_upper']:.6f}] = {r['aipw_lift_vs_overall']:.2f}x")
     print(f"  ({seg['n_distinct_values']:,} distinct f8 values; most common covers "
           f"{seg['top_value_share']:.1%} of users)")
-    rep.add("f8_groups_observed", seg, time.perf_counter() - t0)
+    rep.add("f8_groups", seg, time.perf_counter() - t0)
+    del scores
 
     sample = full.sample(frac=args.model_frac, random_state=args.seed).reset_index(drop=True)
     del full
     print(f"\nModel sample: {len(sample):,} rows ({args.model_frac:.0%})")
 
-    t0 = section("3. AIPW and PSM on the model sample")
+    t0 = section("3. Estimators on the model sample (vs the all-rows AIPW reference)")
     p_treat = float(sample.treatment.mean())
     adj = {}
     for y in args.outcomes:
         adj[y] = {
             "difference_in_means": est_dict(difference_in_means(sample, outcome_col=y)),
             "aipw": est_dict(aipw(sample, FEATURES, outcome_col=y, propensity=p_treat)),
-            "psm": est_dict(PropensityScoreMatching(n_bootstrap=args.psm_bootstrap,
-                                                    seed=args.seed).estimate(sample, FEATURES, outcome_col=y)),
+            "psm": est_dict(PropensityScoreMatching(seed=args.seed)
+                            .estimate(sample, FEATURES, outcome_col=y)),
         }
         for k, r in adj[y].items():
+            r["covers_reference"] = bool(r["ci"][0] <= target[y] <= r["ci"][1])
             print(f"  {y:10s} {k:20s} {r['estimand']} {r['estimate']:.6f} "
-                  f"CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]")
+                  f"CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  covers reference: {r['covers_reference']}")
+        adj[y]["reference"] = target[y]
     rep.add("sample_estimators", adj, time.perf_counter() - t0)
 
     t0 = section("4. Confounded-sample test")
@@ -154,16 +194,18 @@ def main(argv=None) -> int:
     conf_res = {
         "outcome": y0, "confounding_feature": driver, "feature_outcome_corr": corr[driver],
         "rows": len(conf), "control_share": float(1 - conf.treatment.mean()),
-        "target": truth[y0]["estimate"],
+        "control_share_before": float(1 - sample.treatment.mean()),
+        "target": target[y0],
         "naive_difference_in_means": est_dict(naive),
-        "aipw_estimated_propensity": est_dict(aipw(conf, FEATURES, outcome_col=y0)),
-        "psm": est_dict(PropensityScoreMatching(n_bootstrap=args.psm_bootstrap,
-                                                seed=args.seed).estimate(conf, FEATURES, outcome_col=y0)),
+        "aipw_att": est_dict(aipw(conf, FEATURES, outcome_col=y0, estimand="ATT")),
+        "psm": est_dict(PropensityScoreMatching(seed=args.seed)
+                        .estimate(conf, FEATURES, outcome_col=y0)),
     }
-    for k in ("naive_difference_in_means", "aipw_estimated_propensity", "psm"):
+    for k in ("naive_difference_in_means", "aipw_att", "psm"):
         r = conf_res[k]
-        print(f"  {k:28s} {r['estimate']:.6f}  CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  "
-              f"(target {conf_res['target']:.6f})")
+        r["covers_target"] = bool(r["ci"][0] <= conf_res["target"] <= r["ci"][1])
+        print(f"  {k:26s} {r['estimate']:.6f}  CI [{r['ci'][0]:.6f}, {r['ci'][1]:.6f}]  "
+              f"covers target {conf_res['target']:.6f}: {r['covers_target']}")
     rep.add("confounded_test", conf_res, time.perf_counter() - t0)
 
     t0 = section("5. CATE models on a held-out split")
