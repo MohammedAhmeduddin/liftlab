@@ -2,7 +2,6 @@
 """Unit tests for drift detection."""
 import numpy as np
 import pandas as pd
-import pytest
 from liftlab.monitoring.drift import compute_psi, compute_mmd, DriftDetector
 
 
@@ -49,7 +48,6 @@ def test_drift_detector_no_drift():
 
 
 def test_drift_detector_severe_drift():
-    rng = np.random.default_rng(42)
     ref_df = make_df(1000)
     cur_df = make_df(1000, shift=5.0)
     detector = DriftDetector(psi_threshold=0.20, mmd_threshold=0.05)

@@ -28,7 +28,7 @@ class Experiment(Base):
     treatment_col = Column(String(100), nullable=False, default="treatment")
     outcome_col = Column(String(100), nullable=False, default="conversion")
     feature_cols = Column(JSON, nullable=False)       # list[str]
-    estimator = Column(String(50), nullable=False)    # psm|did|tlearner|xlearner|causalforest
+    estimator = Column(String(50), nullable=False)    # difference_in_means|aipw|psm|tlearner|xlearner|causalforest
     sample_frac = Column(Float, nullable=False, default=0.1)
     status = Column(String(50), nullable=False, default="pending")  # pending|running|done|failed
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -59,9 +59,10 @@ class EstimationRun(Base):
     n_control = Column(Integer, nullable=True)
     n_total = Column(Integer, nullable=True)
 
-    # SHAP / segment results stored as JSON
-    shap_importance = Column(JSON, nullable=True)     # {feature: importance}
-    segment_effects = Column(JSON, nullable=True)     # list of segment dicts
+    # Heterogeneity results stored as JSON. The DB column keeps its original
+    # name ("shap_importance") so existing databases need no migration.
+    feature_importance = Column("shap_importance", JSON, nullable=True)  # {feature: importance}
+    segment_effects = Column(JSON, nullable=True)     # observed uplift by predicted-effect quartile
 
     # Run metadata
     estimator = Column(String(50), nullable=False)

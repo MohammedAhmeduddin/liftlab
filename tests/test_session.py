@@ -1,6 +1,8 @@
 # tests/test_session.py
 """Database session tests."""
-from liftlab.db.session import init_db, get_db
+import pytest
+
+from liftlab.db.session import init_db
 
 
 def test_init_db_creates_tables():
@@ -16,3 +18,14 @@ def test_get_db_context_manager():
     from liftlab.db.session import get_db as get_db_context
     with get_db_context() as db:
         assert db is not None
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("postgresql://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+    ("postgres://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+    ("postgresql+psycopg://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+    ("sqlite:///x.db", "sqlite:///x.db"),
+])
+def test_normalize_url(url, expected):
+    from liftlab.db.session import normalize_url
+    assert normalize_url(url) == expected

@@ -15,14 +15,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://liftlab:liftlab@localhost:5432/liftlab"
 
     # MLflow
-    mlflow_tracking_uri: str = "http://localhost:5000"
+    mlflow_tracking_uri: str = "http://localhost:5001"
     mlflow_experiment_name: str = "liftlab-causal"
 
-    # AWS S3
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    s3_bucket: str = "liftlab-artifacts"
-    s3_region: str = "us-east-1"
 
     # Drift thresholds
     psi_threshold: float = 0.2
@@ -33,7 +28,6 @@ class Settings(BaseSettings):
 
     # Data paths
     criteo_data_path: str = "data/criteo_uplift.csv"
-    olist_data_path: str = "data/olist/"
 
 
 @lru_cache
